@@ -13,15 +13,8 @@ Experimental input data and generated results are not included. The Base configu
 
 `Base/CoPPRA_config.R` supports `COPPRA_PROJECT_DIR`, `COPPRA_BASE_OUTPUT`, `COPPRA_OUTPUT_ROOT`, and `COPPRA_BASE_PROTEIN_GROUPS`. Its default project directory is a local desktop path that must be adapted for another machine. `Base/run_Base.R` overrides `COPPRA_PROJECT_DIR` to the parent of its own directory and assumes the original `Base/Code/` layout; review this before using the runner with this repository layout.
 
-## Snapshot completeness
+## Running the analyses
 
-The SEA scripts reference the following helper files, which are absent from this snapshot:
-
-- `CoPPRA_config_SEA.R`
-- `CoPPRA_QC_filters.R`
-- `CoPPRA_CT_comparison.R`
-- `CoPPRA_validation_SEA.R`
-
-These helpers and the required experimental inputs must be supplied before the SEA workflow can run. Some scripts also depend on outputs from earlier stages and on the original project directory layout. Numbered filenames indicate the intended stage order; inspect each stage's prerequisites.
+Some scripts also depend on outputs from earlier stages and on the original project directory layout. Numbered filenames indicate the intended stage order; inspect each stage's prerequisites.
 
 The analyses have not been executed or validated as part of preparing this repository for sharing. The supplied analysis scripts are unchanged.
