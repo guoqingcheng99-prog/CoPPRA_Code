@@ -1,0 +1,160 @@
+---
+title: "2.2 CoPPRA PTM PCA plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 2.1. Each point represents one biological sample. Shaded polygons are the convex hulls of the three biological samples in each predefined group, not confidence regions.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(ggplot2)
+```
+
+
+# Read saved PCA results
+
+
+
+```{r read_pca}
+paths_SEA <- stage_paths_SEA("PCA")
+plot_folder_SEA <- paths_SEA$plots
+list2env(read_data_SEA(file.path(paths_SEA$data, "PCA_plot_data_SEA.rds")), envir = environment())
+```
+
+# PCA by predefined treatment group
+
+
+
+```{r plot_peptide_pca_2d, fig.width=9, fig.height=7}
+pc1_variance_SEA <- round(pca_variance_SEA$Variance_percent[1], 2)
+pc2_variance_SEA <- round(pca_variance_SEA$Variance_percent[2], 2)
+
+pca_hulls_SEA <- pca_scores_SEA[, {
+  hull_index <- chull(PC1, PC2)
+  hull_index <- c(hull_index, hull_index[1])
+  .(
+    PC1 = PC1[hull_index],
+    PC2 = PC2[hull_index]
+  )
+}, by = PCA_group]
+
+group_colors_SEA <- c(
+  Ctrl = "#1F77B4",
+  R = "#D62728",
+  U = "#2CA02C",
+  RU = "#FF7F0E",
+  Carrier = "#9467BD"
+)
+
+set.seed(20260616)
+
+p_pca_2d_SEA <- ggplot() +
+  geom_polygon(
+    data = pca_hulls_SEA,
+    aes(
+      x = PC1,
+      y = PC2,
+      group = PCA_group,
+      fill = PCA_group,
+      color = PCA_group
+    ),
+    alpha = 0.12,
+    linewidth = 0.8,
+    linetype = "dashed",
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = pca_scores_SEA,
+    aes(
+      x = PC1,
+      y = PC2,
+      color = PCA_group,
+      shape = PCA_group
+    ),
+    size = 4,
+    alpha = 0.9
+  ) +
+  ggrepel::geom_text_repel(
+    data = pca_scores_SEA,
+    aes(
+      x = PC1,
+      y = PC2,
+      label = label,
+      color = PCA_group
+    ),
+    size = 3.5,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = group_colors_SEA, drop = FALSE) +
+  scale_fill_manual(values = group_colors_SEA, drop = FALSE) +
+  scale_shape_manual(
+    values = c(Ctrl = 16, R = 17, U = 15, RU = 18, Carrier = 8),
+    drop = FALSE
+  ) +
+  labs(
+    title = "Peptide-level PCA by Experimental Group",
+    x = paste0("PC1 (", pc1_variance_SEA, "% variance)"),
+    y = paste0("PC2 (", pc2_variance_SEA, "% variance)"),
+    color = "Experimental group",
+    shape = "Experimental group"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+print(p_pca_2d_SEA)
+
+save_plot_SEA(p_pca_2d_SEA, "PCA_peptide_2D_grouped", 8, 6)
+```
+
+# Variance explained
+
+
+
+```{r plot_pca_variance_95, fig.width=9, fig.height=7}
+pca_variance_plot_SEA <- copy(pca_variance_95_SEA)
+pca_variance_plot_SEA[, PC := factor(PC, levels = PC)]
+
+p_pca_variance_SEA <- ggplot(
+  pca_variance_plot_SEA,
+  aes(x = PC, y = Variance_percent)
+) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(
+      label = paste0(
+        round(Variance_percent, 1),
+        "%\nCum. ",
+        round(Cumulative_variance_percent, 1),
+        "%"
+      )
+    ),
+    vjust = -0.25,
+    size = 3.5
+  ) +
+  labs(
+    title = "First Principal Components Explaining at Least 95% Variance",
+    x = "Principal component",
+    y = "Variance explained (%)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  ) +
+  expand_limits(
+    y = max(pca_variance_plot_SEA$Variance_percent, na.rm = TRUE) * 1.15
+  )
+
+print(p_pca_variance_SEA)
+
+save_plot_SEA(p_pca_variance_SEA, "PCA_peptide_variance_first_95pct_barplot", 9, 6, dpi = 600)
+```

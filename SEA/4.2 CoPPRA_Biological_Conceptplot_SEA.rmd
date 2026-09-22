@@ -1,0 +1,111 @@
+---
+title: "4.2 CoPPRA PTM biological concept plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 4.1. Draw saved R, U, RU and CT results as dot plots, gene-term networks and enrichment maps. GSEA, mapping and term similarities are not recalculated. Only guards for empty results, insufficient network nodes and degenerate network layouts are retained. Other plotting errors are reported rather than silently replaced with blank figures.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(ggplot2)
+library(enrichplot)
+library(org.Hs.eg.db)
+```
+
+
+# Read prepared plot inputs
+
+
+
+```{r read_plot_data}
+paths_SEA <- stage_paths_SEA("Biological_Concept")
+plot_folder_SEA <- paths_SEA$plots
+list2env(read_data_SEA(file.path(paths_SEA$data, "Biological_Concept_plot_data_SEA.rds")),
+         envir = environment())
+plot_groups_SEA <- c("R", "U", "RU", "CT")
+plot_group_folders_SEA <- setNames(file.path(plot_folder_SEA, plot_groups_SEA), plot_groups_SEA)
+invisible(lapply(plot_group_folders_SEA, dir.create, recursive = TRUE, showWarnings = FALSE))
+set.seed(20260908)
+```
+
+# Plot helpers
+
+
+
+```{r plot_helpers}
+panel_theme_SEA <- theme(plot.background = element_rect(fill = "white", color = NA),
+  panel.background = element_rect(fill = "white", color = NA),
+  legend.background = element_rect(fill = "white", color = NA),
+  plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+  plot.title.position = "plot", plot.margin = margin(12, 30, 12, 12))
+
+empty_panel_SEA <- function(title, reason) {
+  ggplot() + theme_void() + labs(title = title, subtitle = reason) + panel_theme_SEA
+}
+
+make_dot_panel_SEA <- function(x, title) {
+  if (nrow(x@result) == 0L) return(empty_panel_SEA(title, "No significant terms"))
+  enrichplot::dotplot(x, showCategory = show_category_SEA, x = "NES", color = "p.adjust") +
+    labs(title = title) + theme_classic(base_size = 11) + panel_theme_SEA
+}
+
+make_cnet_panel_SEA <- function(x, title) {
+  if (nrow(x@result) == 0L) return(empty_panel_SEA(title, "No significant terms"))
+  enrichplot::cnetplot(x, showCategory = min(show_category_SEA, nrow(x@result)),
+                      node_label = "category", layout = "kk") +
+    labs(title = title) + panel_theme_SEA
+}
+
+make_emap_panel_SEA <- function(x, title, layout) {
+  if (nrow(x@result) < 2L) return(empty_panel_SEA(title, "At least two significant terms are required"))
+  # Similarities were computed in 4.1; this step only draws the stored result.
+  p <- enrichplot::emapplot(x, showCategory = min(show_category_SEA, nrow(x@result)),
+    node_label = "category", layout = layout, min_edge = minimum_term_similarity_SEA)
+  # A finite square plotting range also handles collinear/disconnected terms.
+  # This prevents zero-dimension viewport errors without changing graph edges.
+  p$data$label <- vapply(p$data$label, function(label) {
+    paste(strwrap(label, width = 28), collapse = "\n")
+  }, character(1))
+  xr <- range(p$data$x)
+  yr <- range(p$data$y)
+  span <- max(diff(xr), diff(yr), 1)
+  shown_sim <- x@termsim[p$data$name, p$data$name, drop = FALSE]
+  if (!any(shown_sim[upper.tri(shown_sim)] >= minimum_term_similarity_SEA, na.rm = TRUE) &&
+      diff(yr) < span * 1e-6) {
+    # Separate labels when disconnected terms otherwise lie on one horizontal line.
+    p$data$y <- mean(yr) + seq(-0.25, 0.25, length.out = nrow(p$data)) * span
+  }
+  p + coord_fixed(xlim = mean(xr) + c(-0.65, 0.65) * span,
+                  ylim = mean(yr) + c(-0.65, 0.65) * span, clip = "off") +
+    labs(title = title) + panel_theme_SEA
+}
+```
+
+# Draw all groups
+
+
+
+```{r draw_plots}
+database_titles_SEA <- c(GO_BP = "GO Biological Process", GO_MF = "GO Molecular Function",
+                     GO_CC = "GO Cellular Component", KEGG = "KEGG Pathways")
+for (group in plot_groups_SEA) {
+  for (database in names(plot_inputs_SEA)) {
+    x <- plot_inputs_SEA[[database]][[group]]
+    prefix <- paste(group, database_titles_SEA[[database]])
+    panels <- list(
+      dotplot = make_dot_panel_SEA(x, paste(prefix, "Dot Plot")),
+      cnet = make_cnet_panel_SEA(x, paste(prefix, "Gene-Term Network")),
+      emap = make_emap_panel_SEA(x, paste(prefix, "Enrichment Map"),
+                             layout = if (database == "KEGG") "with_fr" else "kk")
+    )
+    for (kind in names(panels)) {
+      save_plot_SEA(panels[[kind]], paste(database, group, kind, sep = "_"),
+                7, 5.5, folder = plot_group_folders_SEA[[group]])
+    }
+  }
+}
+```

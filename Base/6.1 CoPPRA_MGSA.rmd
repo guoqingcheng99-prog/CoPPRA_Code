@@ -1,0 +1,252 @@
+---
+title: "6.1 CoPPRA MGSA analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 3.1. Fit MGSA to the existing R, U and RU protein calls with the measured protein background. Report terms with posterior probability >= 0.50 and more than five measured genes. Operational CT terms pass this rule in RU and have posterior < 0.50 in R and U. Posterior probabilities are not BH-adjusted P values. The size range was selected exploratorily by comparing CC/MF CT yields on this dataset.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(dplyr)
+library(tidyr)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(GO.db)
+library(KEGGREST)
+library(mgsa)
+```
+
+# Read protein calls and set parameters
+
+```{r read_results}
+paths <- stage_paths("MGSA")
+table_folder <- paths$tables
+minimum_pathway_size <- 5L
+maximum_pathway_size <- 300L
+minimum_reported_size <- 6L
+posterior_cutoff <- 0.50
+minimum_term_similarity <- 0.20
+show_category <- 12L
+mgsa_steps <- 1000000L
+mgsa_burnin <- 500000L
+mgsa_thin <- 100L
+mgsa_restarts <- 5L
+mgsa_threads <- 2L
+mgsa_seed <- 20260921L
+alpha_grid <- seq(0.01, 0.50, length.out = 10)
+beta_grid <- seq(0.01, 0.95, length.out = 10)
+expected_active_terms <- 50L
+
+input_file <- file.path(output_root, "Limma", "data", "Limma_results.rds")
+input_hash <- unname(tools::md5sum(input_file))
+peptide_results <- as_tibble(readRDS(input_file)$peptide_significance)
+protein_calls <- peptide_results %>%
+  dplyr::filter(!is.na(Proteins), Proteins != "") %>%
+  tidyr::separate_rows(Proteins, sep = ";") %>%
+  dplyr::mutate(ProteinID = trimws(Proteins)) %>%
+  dplyr::filter(ProteinID != "") %>%
+  dplyr::distinct(Sequence, ProteinID, .keep_all = TRUE) %>%
+  dplyr::group_by(ProteinID) %>%
+  dplyr::summarise(dplyr::across(c(Ru_sig, Ul_sig, RU_sig),
+    ~any(.x, na.rm = TRUE)), .groups = "drop") %>%
+  dplyr::mutate(UniProt = sub("-\\d+$", "", ProteinID),
+                CT = RU_sig & !Ru_sig & !Ul_sig)
+fwrite(protein_calls, file.path(table_folder, "protein_calls.csv"))
+```
+
+# Map proteins and define the measured background
+
+```{r protein_mapping}
+id_map <- AnnotationDbi::select(org.Hs.eg.db,
+  keys = unique(protein_calls$UniProt), keytype = "UNIPROT",
+  columns = c("ENTREZID", "SYMBOL")) %>%
+  dplyr::distinct(UNIPROT, ENTREZID, SYMBOL)
+mapped <- protein_calls %>%
+  dplyr::left_join(id_map, by = c("UniProt" = "UNIPROT"),
+                   relationship = "many-to-many")
+fwrite(mapped, file.path(table_folder, "protein_to_gene_mapping.csv"))
+mapped <- mapped %>% dplyr::filter(!is.na(ENTREZID))
+background <- sort(unique(as.character(mapped$ENTREZID)))
+observed <- list(R = unique(mapped$ENTREZID[mapped$Ru_sig]),
+                 U = unique(mapped$ENTREZID[mapped$Ul_sig]),
+                 RU = unique(mapped$ENTREZID[mapped$RU_sig]))
+symbols <- mapped %>% dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(SYMBOL = paste(sort(unique(na.omit(SYMBOL))), collapse = ";"),
+                   .groups = "drop")
+symbol_lookup <- setNames(symbols$SYMBOL, symbols$ENTREZID)
+stopifnot(all(vapply(observed, function(x) all(x %in% background), logical(1))))
+fwrite(data.frame(Set = c("Measured background", names(observed)),
+                 Genes = c(length(background), lengths(observed))),
+       file.path(table_folder, "input_summary.csv"))
+```
+
+# Prepare GO and KEGG gene sets
+
+```{r gene_sets}
+# Reuse the saved annotation reference for reproducibility. Removing this file
+# rebuilds GO from the installed database and KEGG from the live REST service.
+reference_file <- file.path(paths$data, "gene_set_reference.rds")
+if (file.exists(reference_file)) {
+  reference <- readRDS(reference_file)
+} else {
+  annotation <- AnnotationDbi::select(org.Hs.eg.db,
+    keys = keys(org.Hs.eg.db, keytype = "ENTREZID"), keytype = "ENTREZID",
+    columns = c("GOALL", "ONTOLOGYALL")) %>%
+    dplyr::filter(!is.na(GOALL), !is.na(ONTOLOGYALL)) %>%
+    dplyr::distinct(ENTREZID, GOALL, ONTOLOGYALL)
+  go_names <- AnnotationDbi::select(GO.db, keys = unique(annotation$GOALL),
+    keytype = "GOID", columns = "TERM")
+  collections <- lapply(c("BP", "MF", "CC"), function(ontology) {
+    x <- annotation[annotation$ONTOLOGYALL == ontology, ]
+    lapply(split(x$ENTREZID, x$GOALL), unique)
+  })
+  names(collections) <- c("GO_BP", "GO_MF", "GO_CC")
+  kegg_link <- KEGGREST::keggLink("pathway", "hsa")
+  kegg_names <- KEGGREST::keggList("pathway", "hsa")
+  collections$KEGG <- lapply(split(sub("^hsa:", "", names(kegg_link)),
+    sub("^path:", "", unname(kegg_link))), unique)
+  descriptions <- setNames(go_names$TERM, go_names$GOID)
+  descriptions <- c(descriptions, setNames(sub(" - Homo sapiens \\(human\\)$", "",
+    unname(kegg_names)), names(kegg_names)))
+  reference <- list(collections = collections, descriptions = descriptions,
+                    created = Sys.Date(), orgdb_version = as.character(packageVersion("org.Hs.eg.db")))
+  saveRDS(reference, reference_file)
+}
+gene_sets <- lapply(reference$collections, function(sets) {
+  sets <- lapply(sets, function(g) intersect(unique(as.character(g)), background))
+  sets[lengths(sets) >= minimum_pathway_size & lengths(sets) <= maximum_pathway_size]
+})
+fwrite(data.frame(Database = names(gene_sets), Terms = lengths(gene_sets)),
+       file.path(table_folder, "gene_set_summary.csv"))
+```
+
+# Fit MGSA
+
+```{r mgsa}
+fit_mgsa <- function(database, contrast) {
+  sets <- gene_sets[[database]]
+  set.seed(mgsa_seed + match(database, c("GO_MF", "GO_CC", "GO_BP", "KEGG")) * 100L +
+             20L + match(contrast, names(observed)))
+  fit <- mgsa::mgsa(o = as.character(observed[[contrast]]), sets = sets,
+    population = background, alpha = alpha_grid, beta = beta_grid,
+    p = seq(1, min(expected_active_terms, floor(length(sets) / 3)),
+            length.out = 10) / length(sets),
+    steps = mgsa_steps, burnin = mgsa_burnin, thin = mgsa_thin,
+    restarts = mgsa_restarts, threads = mgsa_threads)
+  result <- as.data.frame(mgsa::setsResults(fit))
+  result$ID <- rownames(result)
+  result$Description <- unname(reference$descriptions[result$ID])
+  result$Description[is.na(result$Description)] <- result$ID[is.na(result$Description)]
+  chains <- as.matrix(mgsa::setsMcmcPost(fit))
+  if (nrow(chains) != nrow(result)) chains <- t(chains)
+  if (!is.null(rownames(chains))) chains <- chains[match(result$ID, rownames(chains)), , drop = FALSE]
+  stopifnot(ncol(chains) == mgsa_restarts,
+    max(abs(rowMeans(chains) - result$estimate)) < 1e-8,
+    all(result$inPopulation == lengths(sets[result$ID])))
+  result$posterior <- result$estimate
+  result$posterior_se <- result$std.error
+  result$restart_min <- apply(chains, 1, min)
+  result$restart_max <- apply(chains, 1, max)
+  result$active <- result$posterior >= posterior_cutoff &
+    result$inPopulation >= minimum_reported_size
+  result$stable_active <- result$restart_min >= posterior_cutoff &
+    result$inPopulation >= minimum_reported_size
+  hit_sets <- lapply(sets[result$ID], intersect, observed[[contrast]])
+  stopifnot(all(result$inStudySet == lengths(hit_sets)))
+  result$hit_entrez <- vapply(hit_sets, paste, collapse = "/", FUN.VALUE = character(1))
+  result$hit_symbols <- vapply(hit_sets, function(g) {
+    z <- unname(symbol_lookup[g]); z[is.na(z) | z == ""] <- g[is.na(z) | z == ""]
+    paste(z, collapse = "/")
+  }, character(1))
+  result <- result[order(-result$posterior, result$posterior_se), ]
+  prefix <- paste(database, contrast, sep = "_")
+  fwrite(result, file.path(table_folder, paste0(prefix, "_all_MGSA.csv")))
+  fwrite(result[result$active, ], file.path(table_folder, paste0(prefix, "_active_MGSA.csv")))
+  fwrite(data.frame(ID = rownames(mgsa::setsResults(fit)), chains),
+         file.path(table_folder, paste0(prefix, "_restart_posteriors.csv")))
+  saveRDS(fit, file.path(paths$data, paste0(prefix, "_MGSA_fit.rds")))
+  for (parameter in c("alpha", "beta", "p")) {
+    posterior <- switch(parameter, alpha = mgsa::alphaPost(fit),
+      beta = mgsa::betaPost(fit), p = mgsa::pPost(fit))
+    fwrite(as.data.frame(posterior), file.path(table_folder,
+      paste0(prefix, "_", parameter, "_posterior.csv")))
+  }
+  result
+}
+mgsa_results <- setNames(lapply(names(gene_sets), function(database) {
+  setNames(lapply(names(observed), function(contrast) fit_mgsa(database, contrast)), names(observed))
+}), names(gene_sets))
+```
+
+# Identify operational CT terms
+
+```{r conjunctional_concepts}
+find_ct <- function(x) {
+  ru <- x$RU
+  for (contrast in c("R", "U")) {
+    i <- match(ru$ID, x[[contrast]]$ID)
+    stopifnot(!anyNA(i))
+    ru[[paste0("posterior_", contrast)]] <- x[[contrast]]$posterior[i]
+    ru[[paste0("restart_max_", contrast)]] <- x[[contrast]]$restart_max[i]
+  }
+  ru$CT <- ru$active & ru$posterior_R < posterior_cutoff & ru$posterior_U < posterior_cutoff
+  ru$stable_CT <- ru$stable_active & ru$restart_max_R < posterior_cutoff &
+    ru$restart_max_U < posterior_cutoff
+  ru
+}
+comparisons <- lapply(mgsa_results, find_ct)
+conjunctional_concepts <- lapply(comparisons, function(x) x[x$CT, , drop = FALSE])
+for (database in names(comparisons)) {
+  fwrite(comparisons[[database]], file.path(table_folder, paste0(database, "_RU_comparison.csv")))
+  fwrite(conjunctional_concepts[[database]], file.path(table_folder, paste0(database, "_operational_CT.csv")))
+}
+summary_table <- dplyr::bind_rows(lapply(names(mgsa_results), function(database) {
+  x <- mgsa_results[[database]]
+  data.frame(Database = database, R = sum(x$R$active), U = sum(x$U$active), RU = sum(x$RU$active),
+    CT = nrow(conjunctional_concepts[[database]]), stable_CT = sum(comparisons[[database]]$stable_CT))
+}))
+fwrite(summary_table, file.path(table_folder, "MGSA_summary.csv"))
+print(summary_table)
+```
+
+# Prepare plotting inputs and save results
+
+```{r save_results}
+plot_inputs <- lapply(names(mgsa_results), function(database) {
+  selected <- lapply(mgsa_results[[database]], function(x) x[x$active, , drop = FALSE])
+  selected$CT <- conjunctional_concepts[[database]]
+  lapply(names(selected), function(group) {
+    terms <- selected[[group]]
+    observed_genes <- observed[[if (group == "CT") "RU" else group]]
+    hits <- lapply(gene_sets[[database]][terms$ID], intersect, observed_genes)
+    top_ids <- head(terms$ID, show_category)
+    similarity <- matrix(0, length(top_ids), length(top_ids), dimnames = list(top_ids, top_ids))
+    for (i in seq_along(top_ids)) for (j in seq_along(top_ids)) {
+      a <- hits[[top_ids[i]]]; b <- hits[[top_ids[j]]]
+      similarity[i, j] <- if (length(union(a, b))) length(intersect(a, b)) / length(union(a, b)) else 0
+    }
+    list(terms = terms, hits = hits, similarity = similarity)
+  }) |> setNames(names(selected))
+}) |> setNames(names(mgsa_results))
+saveRDS(list(mgsa_results = mgsa_results, conjunctional_concepts = conjunctional_concepts,
+  background = background, observed = observed, gene_sets = gene_sets), file.path(paths$data, "MGSA_results.rds"))
+saveRDS(list(plot_inputs = plot_inputs, symbol_lookup = symbol_lookup, show_category = show_category,
+  posterior_cutoff = posterior_cutoff, minimum_term_similarity = minimum_term_similarity,
+  mgsa_seed = mgsa_seed), file.path(paths$data, "MGSA_plot_data.rds"))
+writeLines(c(paste("Run date:", Sys.Date()),
+  paste("Measured gene-set size:", minimum_pathway_size, "to", maximum_pathway_size),
+  paste("Reporting: posterior >=", posterior_cutoff, "and measured genes >=", minimum_reported_size),
+  "CT: RU selected; R and U posterior < 0.50. This is not an interaction test.",
+  "Size range selected exploratorily to prioritize CC/MF CT candidates.",
+  "Alpha grid 0.01-0.50; beta grid 0.01-0.95; prior 1-50 expected active terms.",
+  "1,000,000 steps; 500,000 burn-in; thin 100; 5 restarts.",
+  "Posterior probabilities are not P values or BH-adjusted P values."),
+  file.path(paths$root, "analysis_parameters.txt"))
+stopifnot(identical(unname(tools::md5sum(input_file)), input_hash))
+fwrite(data.frame(Input = input_file, MD5 = input_hash), file.path(table_folder, "input_checksum.csv"))
+save_session(paths$root)
+```

@@ -1,0 +1,211 @@
+---
+title: "5.1 CoPPRA PEIMAN2 PSEA"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 3.1. Rank the full mapped protein background by median peptide limma log2 fold change for R, U and RU. Exclude categories with no contrast-significant annotated protein before BH adjustment within each contrast. Report terms with BH-adjusted P < 0.05 in either enrichment direction. Leading-edge protein lists retain the existing contrast-specific significance flags.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(PEIMAN2)
+library(fgsea)
+library(ggplot2)
+library(openxlsx)
+knitr::opts_chunk$set(dpi = 600, fig.retina = 1)
+```
+
+# Read limma results and set parameters
+
+```{r read_results}
+paths <- stage_paths("PSEA")
+table_folder <- paths$tables
+plot_folder <- paths$plots
+adjusted_p_cutoff <- 0.05
+groups <- c("R", "U", "RU")
+set.seed(20260908)
+src <- file.path(output_root, "Limma", "tables", "all_peptide_differential_results.csv")
+pep <- fread(src)
+```
+
+# Calculate protein rankings and PTM membership
+
+Accessions are matched exactly, without collapsing isoforms. Shared peptides contribute to each listed accession. Proteins annotated `No ptm` remain in the background, but `No ptm` is not tested as a category.
+
+```{r protein_rankings}
+pep[, `:=`(R = Ru_vs_Control_limma_logFC,
+           U = Ul_vs_Control_limma_logFC,
+           RU = RU_vs_Control_limma_logFC)]
+pep <- pep[is.finite(R) & is.finite(U) & is.finite(RU) &
+             !is.na(Proteins) & nzchar(Proteins)]
+map <- pep[, .(id = trimws(unlist(strsplit(Proteins, ";", fixed = TRUE)))),
+  by = .(Sequence, Proteins, Gene_Names, R, U, RU, Ru_sig, Ul_sig, RU_sig)]
+map <- unique(map[nzchar(id) & !grepl("^(REV__|CON__)", id)], by = c("Sequence", "id"))
+prot <- map[, .(
+  R = median(R), U = median(U), RU = median(RU),
+  R_sig = any(Ru_sig, na.rm = TRUE), U_sig = any(Ul_sig, na.rm = TRUE),
+  RU_sig = any(RU_sig, na.rm = TRUE),
+  peptides = uniqueN(Sequence), shared = any(grepl(";", Proteins, fixed = TRUE)),
+  genes = paste(sort(unique(na.omit(Gene_Names))), collapse = "; ")
+), by = id]
+db <- as.data.table(getFromNamespace("peiman_database", "PEIMAN2"))
+db <- unique(db[OS == "Homo sapiens (Human)", .(id = AC, term = trimws(PTM))])
+prot[, mapped := id %in% db$id]
+bg <- prot[mapped == TRUE, id]
+ann <- db[id %in% bg & !is.na(term) & nzchar(term) & tolower(term) != "no ptm"]
+terms <- split(ann$id, ann$term)
+ranks <- setNames(lapply(groups, function(g) {
+  x <- setNames(prot[mapped == TRUE, get(g)], bg)
+  x[order(-x, names(x))]
+}), groups)
+foreground <- setNames(lapply(groups, function(g) {
+  prot[mapped == TRUE & get(paste0(g, "_sig")) == TRUE, id]
+}), groups)
+stopifnot(all(vapply(ranks, function(x) {
+  length(x) == length(bg) && setequal(names(x), bg) && all(is.finite(x))
+}, logical(1))))
+write_tables(list(protein_scores = prot, term_members = ann), table_folder)
+```
+
+# Run ranked enrichment and adjust P values
+
+`foreground_hits` counts significant proteins anywhere in the category and determines eligibility for BH adjustment. `hits` counts significant leading-edge proteins; `total_hits` retains the complete leading edge. The protein background and category membership inside the ranked test are unchanged.
+
+```{r enrichment}
+ranked_results <- rbindlist(lapply(groups, function(g) {
+  x <- fgsea::fgseaMultilevel(
+    terms, ranks[[g]], minSize = 1, maxSize = length(bg) - 1,
+    eps = 0, sampleSize = 101, nPermSimple = 10000, gseaParam = 1,
+    BPPARAM = BiocParallel::SerialParam()
+  )
+  x[, foreground_hits := vapply(pathway, function(t) {
+    length(intersect(terms[[t]], foreground[[g]]))
+  }, integer(1))]
+  x[, .(set = g, term = pathway, p = pval, NES, ES, size, log2err,
+    foreground_hits, total_hits = lengths(leadingEdge),
+    proteins = vapply(leadingEdge, paste, "", collapse = ";"))]
+}))
+res <- copy(ranked_results[foreground_hits > 0])
+res[, p_adj := p.adjust(p, method = "BH"), by = set]
+res[, `:=`(
+  sig = is.finite(p_adj) & p_adj < adjusted_p_cutoff,
+  direction = fifelse(NES > 0, "Positive", "Negative")
+)]
+res[, proteins := vapply(strsplit(proteins, ";", fixed = TRUE), function(ids) {
+  paste(ids[ids %in% foreground[[.BY$set]]], collapse = ";")
+}, character(1)), by = set]
+res[, hits := lengths(strsplit(proteins, ";", fixed = TRUE))]
+res <- res[order(match(set, groups), p_adj, p, term)]
+sig <- res[sig == TRUE]
+counts <- rbindlist(lapply(groups, function(g) {
+  data.table(
+    set = g, ranked = length(bg), terms = nrow(res[set == g]),
+    significant = nrow(sig[set == g]), positive = nrow(sig[set == g & NES > 0]),
+    negative = nrow(sig[set == g & NES < 0]), ties = sum(duplicated(ranks[[g]])),
+    significant_proteins = length(foreground[[g]])
+  )
+}))
+write_tables(list(summary = counts, all_terms = res, significant_terms = sig), table_folder)
+knitr::kable(counts)
+```
+
+# Significant terms
+
+```{r term_tables, results='asis'}
+for (g in groups) {
+  cat("\n\n## ", g, "\n\n", sep = "")
+  print(knitr::kable(sig[set == g, .(
+    Term = term, Direction = direction, NES = round(NES, 3),
+    `Raw P` = format.pval(p, digits = 4, eps = 1e-300),
+    `BH-adjusted P` = format.pval(p_adj, digits = 4, eps = 1e-300),
+    Members = size, `Significant members` = foreground_hits,
+    `Significant leading edge` = hits, `Total leading edge` = total_hits
+  )]))
+  cat("\n\n")
+  fwrite(sig[set == g], file.path(table_folder, paste0(g, "_significant_terms.csv")))
+}
+```
+
+# Enrichment plots
+
+Lollipop plots show NES, significant leading-edge count and the actual BH-adjusted P value (P.adj). Individual plots include all significant terms; the overview includes up to 12 per contrast. Running-score plots show the top six terms. Terms are ordered by adjusted P, then raw P.
+
+```{r plots, fig.width=11, fig.height=8}
+plot_PSEA <- function(g, top = Inf) {
+  x <- copy(sig[set == g][seq_len(min(.N, top))])
+  x[, term := factor(term, levels = term[order(NES, term)])]
+  ggplot(x, aes(NES, term)) +
+    geom_vline(xintercept = 0, color = "grey65", linetype = 2) +
+    geom_segment(aes(x = 0, xend = NES, yend = term), color = "grey40", linewidth = 0.8) +
+    geom_point(aes(size = hits, fill = p_adj), shape = 21) +
+    scale_fill_gradient(low = "maroon3", high = "mediumslateblue", name = "p.adj") +
+    scale_size_continuous(name = "Significant\nleading-edge count", range = c(3, 9)) +
+    labs(title = paste(g, "PTM PSEA"), x = "Normalized enrichment score (NES)", y = NULL) +
+    theme_bw(base_size = 14) + theme(axis.text.y = element_text(face = "bold"),
+      panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+}
+for (g in groups) {
+  p <- plot_PSEA(g)
+  print(p)
+  h <- 5
+  save_plot(p, paste0(g, "_PSEA"), width = 7, height = h, dpi = 600)
+}
+overview <- function() {
+  grid::grid.newpage()
+  grid::pushViewport(grid::viewport(layout = grid::grid.layout(2, 2)))
+  for (i in seq_along(groups)) {
+    print(plot_PSEA(groups[i], 12), vp = grid::viewport(
+      layout.pos.row = (i - 1) %/% 2 + 1, layout.pos.col = (i - 1) %% 2 + 1))
+  }
+}
+png(file.path(plot_folder, "PSEA_overview.png"), width = 5600 / 300,
+    height = 3500 / 300, units = "in", res = 600, type = "cairo")
+overview()
+dev.off()
+pdf(file.path(plot_folder, "PSEA_overview.pdf"), width = 7, height = 5)
+overview()
+dev.off()
+for (g in groups) {
+  x <- head(sig[set == g], 6)
+  if (!nrow(x)) next
+  pdf(file.path(plot_folder, paste0(g, "_running_scores.pdf")), width = 7, height = 5)
+  for (t in x$term) {
+    print(fgsea::plotEnrichment(terms[[t]], ranks[[g]]) +
+      labs(title = paste(g, "PSEA:", t), subtitle = paste0(
+        "NES = ", round(x[term == t, NES], 3),
+        "; BH-adjusted P = ", format.pval(x[term == t, p_adj], digits = 4))))
+  }
+  dev.off()
+}
+```
+
+# Export contributing proteins and results
+
+Protein links identify significant leading-edge proteins with PEIMAN2 annotations; they do not measure modified-peptide abundance.
+
+```{r export}
+links <- sig[nzchar(proteins), .(id = unlist(strsplit(proteins, ";", fixed = TRUE))),
+  by = .(set, term, p, p_adj, NES)]
+links <- merge(links, prot, by = "id", all.x = TRUE, sort = FALSE)
+setcolorder(links, c("set", "term", "p", "p_adj", "NES", "id", setdiff(names(prot), "id")))
+fwrite(links, file.path(table_folder, "leading_edge_proteins.csv"))
+notes <- data.table(
+  item = c("Significance", "Ranking", "Categories", "Proteins"),
+  value = c(
+    paste0("BH-adjusted P < ", adjusted_p_cutoff, "; both NES directions"),
+    "Median peptide limma log2 fold change; full common mapped background; accession-ordered ties",
+    "BH within each contrast after excluding categories with no significant annotated member",
+    "hits/proteins: significant leading edge; total_hits: full leading edge; foreground_hits: significant category members"
+  )
+)
+sheets <- list(Summary = counts, Significant = sig, All_terms = res[, !"proteins"],
+  Protein_links = links, Protein_scores = prot, Term_members = ann, Notes = notes)
+write.xlsx(sheets, file.path(paths$root, "CoPPRA_PEIMAN_PSEA.xlsx"),
+  asTable = TRUE, firstRow = TRUE, colWidths = 24, overwrite = TRUE)
+saveRDS(list(ranks = ranks, terms = terms, res = res, ranked_results = ranked_results,
+  background = bg, foreground = foreground), file.path(paths$data, "PSEA_results.rds"))
+save_session(paths$root)
+```

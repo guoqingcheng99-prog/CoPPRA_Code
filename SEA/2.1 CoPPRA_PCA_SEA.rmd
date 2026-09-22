@@ -1,0 +1,132 @@
+---
+title: "2.1 CoPPRA SEA PCA analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 1.1. Use the saved biological peptide matrix, including carriers. Retain peptides observed in at least two biological samples and replace remaining missing values with the peptide median only for PCA. Samples are observations; peptides are centered, unscaled variables.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(matrixStats)
+library(PCAtools)
+```
+
+
+# Read and prepare the PCA matrix
+
+
+
+```{r prepare_matrix}
+paths_SEA <- stage_paths_SEA("PCA")
+table_folder_SEA <- paths_SEA$tables
+q_SEA <- readRDS(file.path(output_root_SEA, "QC", "data", "quantification_SEA.rds"))
+sample_map_SEA <- copy(q_SEA$sample_map)
+sample_map_SEA[, PCA_group := factor(as.character(Condition),
+  levels = c("Ctrl", "R", "U", "RU", "Carrier"))]
+sample_map_SEA[, Experiment_order := order(order(PCA_group, Bio_rep))]
+sample_map_SEA[, Biological_replicate := Bio_rep]
+setorder(sample_map_SEA, Experiment_order)
+pca_samples_SEA <- sample_map_SEA$Experiment
+pca_source_SEA <- q_SEA$biological_log2[, pca_samples_SEA, drop = FALSE]
+pca_matrix_SEA <- pca_source_SEA[rowSums(is.finite(pca_source_SEA)) >= 2L, , drop = FALSE]
+peptide_medians_SEA <- matrixStats::rowMedians(pca_matrix_SEA, na.rm = TRUE)
+missing_index_SEA <- which(!is.finite(pca_matrix_SEA), arr.ind = TRUE)
+pca_matrix_SEA[missing_index_SEA] <- peptide_medians_SEA[missing_index_SEA[, 1]]
+fwrite(matrix_table_SEA(pca_matrix_SEA), file.path(table_folder_SEA, "PCA_peptide_matrix_used_SEA.csv"))
+fwrite(sample_map_SEA, file.path(table_folder_SEA, "PCA_group_classification_SEA.csv"))
+```
+
+# Calculate PCA
+
+
+
+```{r run_pca}
+pca_metadata_SEA <- sample_map_SEA[, .(
+  label = Experiment,
+  PCA_group,
+  Biological_replicate
+)]
+
+pca_metadata_df_SEA <- as.data.frame(pca_metadata_SEA)
+rownames(pca_metadata_df_SEA) <- pca_metadata_df_SEA$label
+
+pca_result_SEA <- PCAtools::pca(
+  pca_matrix_SEA,
+  metadata = pca_metadata_df_SEA,
+  removeVar = 0,
+  center = TRUE,
+  scale = FALSE
+)
+
+pca_scores_SEA <- as.data.table(
+  pca_result_SEA$rotated,
+  keep.rownames = "label"
+)
+pca_scores_SEA <- merge(
+  pca_scores_SEA,
+  pca_metadata_SEA,
+  by = "label",
+  sort = FALSE
+)
+pca_scores_SEA[, Experiment_order := match(label, pca_samples_SEA)]
+setorder(pca_scores_SEA, Experiment_order)
+
+pca_variance_SEA <- data.table(
+  PC = paste0("PC", seq_along(pca_result_SEA$variance)),
+  PC_number = seq_along(pca_result_SEA$variance),
+  Variance_percent = as.numeric(pca_result_SEA$variance),
+  Cumulative_variance_percent = cumsum(
+    as.numeric(pca_result_SEA$variance)
+  )
+)
+
+n_pc_95_SEA <- which(
+  pca_variance_SEA$Cumulative_variance_percent >= 95
+)[1]
+pca_variance_95_SEA <- pca_variance_SEA[seq_len(n_pc_95_SEA)]
+
+fwrite(
+  pca_scores_SEA,
+  file.path(table_folder_SEA, "PCA_peptide_scores_SEA.csv")
+)
+fwrite(
+  pca_variance_SEA,
+  file.path(table_folder_SEA, "PCA_peptide_variance_all_PCs_SEA.csv")
+)
+fwrite(
+  pca_variance_95_SEA,
+  file.path(table_folder_SEA, "PCA_peptide_variance_first_95pct_SEA.csv")
+)
+
+cat(
+  "Number of first PCs needed to explain at least 95% variance:",
+  n_pc_95_SEA,
+  "\n"
+)
+knitr::kable(
+  pca_variance_95_SEA,
+  digits = 2,
+  caption = "First principal components explaining at least 95% variance"
+)
+```
+
+# Save PCA results
+
+
+
+```{r save_pca}
+pca_summary_SEA <- data.table(
+  Metric = c("Evidence rows", "PCA peptides", "Biological samples", "PC1 variance (%)", "PC2 variance (%)"),
+  Value = c(q_SEA$n_evidence, nrow(pca_matrix_SEA), ncol(pca_matrix_SEA), pca_variance_SEA$Variance_percent[1:2])
+)
+fwrite(pca_summary_SEA, file.path(table_folder_SEA, "PCA_analysis_summary_SEA.csv"))
+saveRDS(list(pca_scores = pca_scores_SEA, pca_variance = pca_variance_SEA,
+            pca_variance_95 = pca_variance_95_SEA), file.path(paths_SEA$data, "PCA_plot_data_SEA.rds"))
+saveRDS(pca_result_SEA, file.path(paths_SEA$data, "PCA_result_SEA.rds"))
+save_session_SEA(paths_SEA$root)
+knitr::kable(pca_summary_SEA)
+```

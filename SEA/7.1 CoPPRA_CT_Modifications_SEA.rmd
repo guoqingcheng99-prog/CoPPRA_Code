@@ -1,0 +1,79 @@
+---
+title: "7.2 Modified evidence supporting SEA CT proteins"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 7.1. Annotate the existing SEA CT definition (`RU_sig & !Ru_sig & !Ul_sig`) with modification-bearing evidence that actually survived SEA QC. Keep exact protein accessions and the original raw-P and fold-change thresholds. Group-shared evidence is marked explicitly. A modified form observed on a significant pooled sequence supports an association with that sequence; it is not a modification-specific differential test or proof of localized sites.
+
+```{r setup}
+source("CoPPRA_config_SEA.R",local=TRUE)
+source("CoPPRA_validation_SEA.R",local=TRUE)
+paths_SEA <- stage_paths_SEA("CT_modifications")
+v <- readRDS(file.path(output_root_SEA,"Search_validation/data/Search_validation_SEA.rds"))
+base_output <- path.expand(Sys.getenv("COPPRA_BASE_OUTPUT",unset=file.path(dirname(project_dir_SEA),"Base","Results")))
+result_files <- c(Base=file.path(base_output,"Limma/data/Limma_results.rds"),
+  SEA=file.path(output_root_SEA,"Limma/data/Limma_results_SEA.rds"))
+r <- lapply(result_files,readRDS)
+stopifnot(identical(r$Base$pval_threshold,r$SEA$pval_threshold),identical(r$Base$log2fc_threshold,r$SEA$log2fc_threshold))
+ct_sets <- lapply(r,function(x) as.data.table(x$protein_significance)[RU_sig & !Ru_sig & !Ul_sig,ProteinID])
+stopifnot(!anyDuplicated(ct_sets$SEA),!anyDuplicated(ct_sets$Base))
+```
+
+# Analysis: trace retained modified evidence to CT proteins
+
+```{r ct_annotation}
+f <- copy(v$forms)
+f[,Form_row:=.I]
+map <- f[,.(ProteinID=split_ids_validation(Proteins)),by=Form_row]
+f <- merge(f,map,by="Form_row",allow.cartesian=TRUE)[ProteinID%in%ct_sets$SEA]
+p <- as.data.table(r$SEA$peptide_significance)
+stopifnot(!anyDuplicated(p$Sequence),all(f$Sequence %in% v$sets$Existing_analysis$SEA$Peptide_sequences))
+f[,Sequence_tested_in_limma := Sequence %in% p$Sequence]
+f[p,on="Sequence",`:=`(RU_sig_sequence=i.RU_sig,R_sig_sequence=i.Ru_sig,U_sig_sequence=i.Ul_sig,Group_gene_names=i.Gene_Names,Group_protein_names=i.Protein_Names)]
+ct <- data.table(ProteinID=sort(ct_sets$SEA))
+support <- f[,.(Group_gene_names=paste(split_ids_validation(Group_gene_names),collapse=";"),
+  Group_protein_names=paste(sort(unique(na.omit(Group_protein_names))),collapse=" | "),
+  All_sequences=uniqueN(Sequence),Modified_sequences=uniqueN(Sequence[Is_modified==TRUE]),
+  Modified_forms=uniqueN(Modified.sequence[Is_modified==TRUE]),Phospho_STY_sequences=uniqueN(Sequence[Has_Phospho_STY==TRUE]),
+  Phospho_STY_forms=uniqueN(Modified.sequence[Has_Phospho_STY==TRUE]),
+  Modified_sequences_in_RU=uniqueN(Sequence[Is_modified & QC_condition=="RU"]),
+  Phospho_STY_sequences_in_RU=uniqueN(Sequence[Has_Phospho_STY & QC_condition=="RU"]),
+  Modified_RU_sig_sequences=uniqueN(Sequence[Is_modified & (RU_sig_sequence %in% TRUE) & QC_condition=="RU"]),
+  Phospho_STY_RU_sig_sequences=uniqueN(Sequence[Has_Phospho_STY & (RU_sig_sequence %in% TRUE) & QC_condition=="RU"]),
+  Modified_single_member_group_forms=uniqueN(Modified.sequence[Is_modified & Group_members==1L]),
+  Phospho_STY_single_member_group_forms=uniqueN(Modified.sequence[Has_Phospho_STY & Group_members==1L]),
+  Modification_categories=paste(sort(unique(unlist(lapply(Modifications[Is_modified==TRUE],mod_categories)))),collapse=";"),
+  ProteinGroups=paste(sort(unique(Proteins)),collapse=" | ")),by=ProteinID]
+ct <- merge(ct,support,by="ProteinID",all.x=TRUE)
+stopifnot(!anyNA(ct$All_sequences))
+ct[,`:=`(Base_CT=ProteinID%in%ct_sets$Base,Has_modified_evidence=Modified_forms>0L,
+  Has_Phospho_STY=Phospho_STY_forms>0L)]
+ct[,CT_region:=fifelse(Base_CT,"Shared CT","SEA-only CT")]
+counts <- ct[,.(CT_proteins=.N,With_modified_evidence=sum(Has_modified_evidence),
+  With_Phospho_STY=sum(Has_Phospho_STY),With_modified_evidence_in_RU=sum(Modified_sequences_in_RU>0),
+  With_Phospho_STY_in_RU=sum(Phospho_STY_sequences_in_RU>0),
+  With_Phospho_STY_on_RU_sig_sequence_in_RU=sum(Phospho_STY_RU_sig_sequences>0)),by=CT_region]
+counts <- rbind(counts,ct[,.(CT_region="All SEA CT",CT_proteins=.N,With_modified_evidence=sum(Has_modified_evidence),
+  With_Phospho_STY=sum(Has_Phospho_STY),With_modified_evidence_in_RU=sum(Modified_sequences_in_RU>0),
+  With_Phospho_STY_in_RU=sum(Phospho_STY_sequences_in_RU>0),
+  With_Phospho_STY_on_RU_sig_sequence_in_RU=sum(Phospho_STY_RU_sig_sequences>0))])
+modified <- f[Is_modified==TRUE]
+category_map <- rbindlist(lapply(unique(modified$Modifications),function(z)
+  data.table(Modifications=z,Category=mod_categories(z))))
+category_counts <- merge(modified,category_map,by="Modifications",allow.cartesian=TRUE)[
+  ,.(CT_proteins=uniqueN(ProteinID),Sequences=uniqueN(Sequence),Modified_forms=uniqueN(Modified.sequence)),by=Category]
+write_tables_SEA(list(CT_modification_annotation=ct,CT_modification_counts=counts,
+  CT_modified_evidence=modified,CT_Phospho_STY_evidence=f[Has_Phospho_STY==TRUE],
+  CT_modification_categories=category_counts,CT_with_Phospho_STY=ct[Has_Phospho_STY==TRUE]),paths_SEA$tables)
+saveRDS(list(annotation=ct,counts=counts,categories=category_counts,ct_sets=ct_sets),
+  file.path(paths_SEA$data,"CT_modifications_SEA.rds"))
+fwrite(data.table(Dataset=names(result_files),File=unname(result_files),MD5=unname(tools::md5sum(result_files))),
+  file.path(paths_SEA$tables,"CT_result_inputs_SEA.csv"))
+knitr::kable(counts)
+knitr::kable(ct[Has_Phospho_STY==TRUE])
+save_session_SEA(paths_SEA$root)
+```

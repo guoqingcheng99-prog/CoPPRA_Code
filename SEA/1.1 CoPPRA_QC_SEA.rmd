@@ -1,0 +1,355 @@
+---
+title: "1.1 CoPPRA SEA QC, quantification and coverage"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run this file first. Modified signals are included, and all modification forms are pooled by `Sequence`. Modification-specific quantification is not possible from the resulting peptide matrix. This matches the modification handling in `RU_Dec25_v2(4).Rmd`; that TMT script uses different normalization (reporter-total scaling and quantile normalization). Here the existing label-free PSM median-centering is shared by QC, PCA and limma.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+source("CoPPRA_QC_filters.R", local = TRUE)
+```
+
+
+# Read and filter evidence once
+
+Read evidence once, then apply the QC filters after sample assignment. Retain evidence Q-values <= 0.01, protein-group Q-values <= 0.01, and unique-plus-razor peptides assigned to passing protein groups. Exclude decoys, contaminants and protein groups flagged only identified by site. First remove protein accessions supported by fewer than two distinct peptide sequences, then retain peptide sequences detected in at least 20% of all input raw files (9 of 45). The protein filter removes excluded accessions from annotations and discards evidence rows mapped only to excluded accessions. Modified peptide forms remain pooled by `Sequence`; modification status itself is not an exclusion criterion. A PEP is not treated as a q-value.
+
+```{r read_evidence}
+paths_SEA <- stage_paths_SEA("QC")
+qc_dir_SEA <- paths_SEA$tables
+
+# Group flags and peptide-is-razor assignments come from the matching proteinGroups table.
+evidence_SEA <- fread(evidence_file_SEA, na.strings = c("", "NA"), select = c(
+  "Raw file", "Experiment", "Sequence", "Decoy", "Potential contaminant",
+  "Proteins", "Leading proteins", "Leading razor proteins", "Protein group IDs",
+  "Peptide ID", "Gene Names", "Protein Names", "Intensity", "Q-value"
+))
+setnames(evidence_SEA, make.names(names(evidence_SEA)))
+n_input_SEA <- nrow(evidence_SEA)
+run_assignment_SEA <- unique(evidence_SEA[, .(Raw.file, Experiment)])
+
+```
+
+# Assign samples once
+
+
+
+```{r sample_metadata}
+sample_map_SEA <- data.table(
+  Experiment = c(paste0("R", 1:3), paste0("U", 1:3), paste0("RU", 1:3),
+                 paste0("Ctrl", 1:3), paste0("Carrier", 1:3)),
+  Condition = factor(rep(c("R", "U", "RU", "Ctrl", "Carrier"), each = 3),
+                     levels = c("R", "U", "RU", "Ctrl", "Carrier")),
+  Bio_rep = rep(1:3, 5), Sample_order = 1:15
+)
+runs_SEA <- merge(run_assignment_SEA, sample_map_SEA, by = "Experiment", all.x = TRUE)
+runs_SEA[, Tech_rep := as.integer(sub(".*_", "", Raw.file))]
+
+# One input-level check protects sample labels throughout the entire series.
+stopifnot(!anyNA(runs_SEA), !anyDuplicated(runs_SEA$Raw.file),
+          setequal(runs_SEA$Experiment, sample_map_SEA$Experiment),
+          all(runs_SEA[, uniqueN(Tech_rep), by = Experiment]$V1 == 3L),
+          all(runs_SEA$Tech_rep %in% 1:3), nrow(runs_SEA) == 45L)
+setorder(runs_SEA, Sample_order, Tech_rep)
+samples_SEA <- merge(sample_map_SEA, runs_SEA[, .(Technical_runs = .N), by = Experiment],
+                 by = "Experiment")
+setorder(samples_SEA, Sample_order)
+raw_order_SEA <- runs_SEA$Raw.file
+sample_order_SEA <- samples_SEA$Experiment
+write_tables_SEA(list(QC_raw_file_metadata = runs_SEA, QC_experiment_metadata = samples_SEA), qc_dir_SEA)
+knitr::kable(samples_SEA)
+```
+
+# Apply QC and compare coverage
+
+After the existing quality and unique-plus-razor assignment filters, count distinct pooled `Sequence` values for each accession in the existing SEA `Proteins` mapping across all samples. Retain accessions supported by at least two sequences and remove evidence mapped only to excluded accessions. Next count distinct raw files per pooled `Sequence`, including carriers: `ceiling(0.20 * 45) = 9`. Multiple evidence rows, charge states or modification forms in one raw file count as one detection. The denominator remains all input raw files. There is no additional biological-replicate requirement and no second protein filter after detection filtering; a retained protein can finish with one peptide.
+
+Before/after coverage reports observed peptide sequences, protein accessions and verified protein groups, with intermediate totals before these two filters and after the protein filter. All-sample and non-carrier totals are reported separately. Completeness uses each stage's peptide universe and the original raw-file set. All subsequent quantification and analyses use the filtered evidence.
+
+```{r apply_qc}
+qc_filter_result_SEA <- coppra_qc(evidence_SEA, sample_map_SEA,
+  protein_groups_file = protein_groups_file_SEA, audit_dir = qc_dir_SEA, suffix = "_SEA",
+  evidence_q_max = 0.01, protein_q_max = 0.01,
+  min_bio_replicates = 2L, min_protein_peptides = 2L,
+  filter_peptide_recurrence = FALSE, filter_protein_peptide_count = TRUE,
+  min_raw_file_fraction = 0.20)
+knitr::kable(qc_filter_result_SEA$stages[, .(Stage, Status,
+  Evidence_rows_removed, Peptide_sequences_removed, Candidate_protein_group_IDs_removed,
+  Evidence_rows, Peptide_sequences, Protein_accessions, Candidate_protein_group_IDs)])
+knitr::kable(qc_filter_result_SEA$coverage)
+if (!isTRUE(qc_filter_result_SEA$complete)) {
+  stop("QC is incomplete: provide matching proteinGroups_SEA_v2.txt. Coverage audit saved, but no new downstream quantification is written.")
+}
+evidence_SEA <- qc_filter_result_SEA$evidence
+if (!nrow(evidence_SEA)) stop("No evidence passes QC; inspect QC_filter_stages_SEA.csv.")
+filter_summary_SEA <- data.table(
+  Metric = c("Input evidence rows", "Quantified target rows retained", "Rows removed"),
+  Value = c(n_input_SEA, nrow(evidence_SEA), n_input_SEA - nrow(evidence_SEA)))
+fwrite(filter_summary_SEA, file.path(qc_dir_SEA, "QC_filter_summary_SEA.csv"))
+qc_coverage_before_after_SEA <- qc_filter_result_SEA$coverage
+qc_filter_stages_SEA <- qc_filter_result_SEA$stages
+qc_filter_status_SEA <- qc_filter_result_SEA$status
+rm(qc_filter_result_SEA)
+```
+
+# PSM normalization and sequence quantification
+
+Log2-transform and median-centre evidence intensities within each raw file, then take the median by unmodified `Sequence`. Aggregate available technical-run log2 values by another median. Missing values stay `NA`. The raw linear median is exported for descriptive intensity QC; the normalized log2 matrix is the shared analysis input.
+
+```{r quantification}
+evidence_SEA[, PSM_log2_intensity := log2(Intensity)]
+evidence_SEA[, Raw_file_median := median(PSM_log2_intensity), by = Raw.file]
+evidence_SEA[, PSM_normalized_log2 := PSM_log2_intensity - Raw_file_median]
+
+norm_SEA <- evidence_SEA[, .(
+  Evidence_rows = .N,
+  Raw_median_log2 = Raw_file_median[1L],
+  Median_after_normalization = median(PSM_normalized_log2),
+  IQR_after_normalization = IQR(PSM_normalized_log2)
+), by = .(Raw.file, Experiment)]
+norm_SEA <- merge(runs_SEA, norm_SEA, by = c("Raw.file", "Experiment"), all.x = TRUE)
+setorder(norm_SEA, Sample_order, Tech_rep)
+
+# Every retained evidence row has equal weight within its Sequence/raw-file group.
+# Modified and unmodified forms (and different charges) are pooled here.
+pep_run_SEA <- evidence_SEA[, .(
+  Peptide_intensity = median(Intensity),
+  Norm_log2 = median(PSM_normalized_log2),
+  PSM_count = .N
+), by = .(Sequence, Raw.file, Experiment)]
+pep_run_SEA[, Norm_intensity := 2^Norm_log2]
+
+# Technical runs have equal weight within each biological sample.
+pep_sample_SEA <- pep_run_SEA[, .(
+  Peptide_intensity = median(Peptide_intensity),
+  Norm_log2 = median(Norm_log2),
+  Runs_detected = uniqueN(Raw.file),
+  Total_PSM_count = sum(PSM_count)
+), by = .(Sequence, Experiment)]
+pep_sample_SEA[, Norm_intensity := 2^Norm_log2]
+pep_sample_norm_SEA <- pep_sample_SEA[, .(Sequence, Experiment, Norm_intensity, Runs_detected)]
+
+# Union annotations across contributing rows; do not choose only the first row.
+# Annotation availability never removes an otherwise valid quantitative signal.
+collapse_ids_SEA <- function(x) {
+  ids <- trimws(unlist(strsplit(x[!is.na(x)], ";", fixed = TRUE)))
+  paste(sort(unique(ids[nzchar(ids)])), collapse = ";")
+}
+peptide_annotation_SEA <- evidence_SEA[, .(
+  Proteins = collapse_ids_SEA(Proteins),
+  Leading_proteins = collapse_ids_SEA(Leading.proteins),
+  Gene_Names = collapse_ids_SEA(Gene.Names),
+  Protein_Names = collapse_ids_SEA(Protein.Names)
+), by = Sequence]
+
+raw_mat_SEA <- to_matrix_SEA(pep_run_SEA, "Raw.file", "Peptide_intensity", raw_order_SEA)
+raw_log2_SEA <- to_matrix_SEA(pep_run_SEA, "Raw.file", "Norm_log2", raw_order_SEA)
+raw_norm_SEA <- 2^raw_log2_SEA
+sample_mat_SEA <- to_matrix_SEA(pep_sample_SEA, "Experiment", "Peptide_intensity", sample_order_SEA)
+sample_log2_SEA <- to_matrix_SEA(pep_sample_SEA, "Experiment", "Norm_log2", sample_order_SEA)
+sample_norm_SEA <- 2^sample_log2_SEA
+
+write_tables_SEA(list(
+  QC_PSM_normalization_summary = norm_SEA,
+  peptide_by_raw_file = pep_run_SEA,
+  peptide_by_biological_experiment = pep_sample_SEA,
+  peptide_annotations = peptide_annotation_SEA,
+  peptide_normalized_log2_raw_file_matrix = matrix_table_SEA(raw_log2_SEA),
+  peptide_normalized_log2_biological_matrix = matrix_table_SEA(sample_log2_SEA)
+), qc_dir_SEA)
+```
+
+# Coverage and completeness
+
+Peptide depth counts distinct unmodified sequences. Protein depth counts the retained assigned MaxQuant protein groups. Group membership is preserved; member accessions are not independent protein identifications. Completeness uses the union of all retained peptide sequences; missing values are not imputed.
+
+```{r coverage}
+count_groups_SEA <- function(x) uniqueN(x[!is.na(x) & x != ""])
+coverage_SEA <- function(data, groups) {
+  data[, .(Evidence_rows = .N, Unique_peptides = uniqueN(Sequence),
+    Leading_protein_groups = count_groups_SEA(Leading.proteins),
+    Total_intensity = sum(Intensity), Median_log2_intensity = median(log2(Intensity))),
+    by = groups]
+}
+run_cov_SEA <- merge(runs_SEA, coverage_SEA(evidence_SEA, c("Raw.file", "Experiment")),
+                  by = c("Raw.file", "Experiment"), all.x = TRUE)
+sample_cov_SEA <- merge(samples_SEA, coverage_SEA(evidence_SEA, "Experiment"), by = "Experiment", all.x = TRUE)
+setorder(run_cov_SEA, Sample_order, Tech_rep)
+setorder(sample_cov_SEA, Sample_order)
+run_cov_SEA[, Peptide_missingness := colMeans(is.na(raw_mat_SEA))[Raw.file]]
+sample_cov_SEA[, Peptide_missingness := colMeans(is.na(sample_mat_SEA))[Experiment]]
+run_cov_SEA[, Peptide_completeness := 1 - Peptide_missingness]
+sample_cov_SEA[, Peptide_completeness := 1 - Peptide_missingness]
+
+condition_evidence_SEA <- merge(evidence_SEA[, .(Experiment, Raw.file, Sequence, Leading.proteins)],
+                            sample_map_SEA[, .(Experiment, Condition)], by = "Experiment")
+condition_cov_SEA <- condition_evidence_SEA[, .(
+  Biological_samples = uniqueN(Experiment), Raw_files = uniqueN(Raw.file),
+  Unique_peptides = uniqueN(Sequence), Leading_protein_groups = count_groups_SEA(Leading.proteins)
+), by = Condition]
+setorder(condition_cov_SEA, Condition)
+protein_ids_SEA <- trimws(unlist(strsplit(unique(na.omit(evidence_SEA$Proteins)), ";", fixed = TRUE)))
+overall_cov_SEA <- data.table(
+  Metric = c("Raw files", "Biological samples", "Conditions", "Unique peptide sequences",
+    "Unique leading protein groups", "Unique individual protein accessions",
+    "Median peptides per raw file", "Median leading protein groups per raw file"),
+  Value = c(nrow(runs_SEA), nrow(samples_SEA), uniqueN(samples_SEA$Condition), uniqueN(evidence_SEA$Sequence),
+    count_groups_SEA(evidence_SEA$Leading.proteins), count_groups_SEA(protein_ids_SEA),
+    median(run_cov_SEA$Unique_peptides, na.rm = TRUE), median(run_cov_SEA$Leading_protein_groups, na.rm = TRUE))
+)
+knitr::kable(overall_cov_SEA)
+knitr::kable(condition_cov_SEA)
+```
+
+# Technical and biological reproducibility
+
+Pearson correlations use pairwise-complete normalized log2 peptide values. Technical pairs are within biological sample; biological pairs are within condition. These are descriptive metrics and do not remove runs.
+
+```{r correlations}
+run_cor_SEA <- cor(raw_log2_SEA, use = "pairwise.complete.obs", method = "pearson")
+sample_cor_SEA <- cor(sample_log2_SEA, use = "pairwise.complete.obs", method = "pearson")
+
+correlation_pairs_SEA <- function(x) {
+  ij <- which(upper.tri(x), arr.ind = TRUE)
+  data.table(ID1 = rownames(x)[ij[, 1]], ID2 = colnames(x)[ij[, 2]], Pearson = x[ij])
+}
+all_run_pairs_SEA <- correlation_pairs_SEA(run_cor_SEA)
+tech_pairs_SEA <- merge(all_run_pairs_SEA, runs_SEA[, .(ID1 = Raw.file, Experiment, Condition,
+                    Sample_order, Tech1 = Tech_rep)], by = "ID1")
+tech_pairs_SEA <- merge(tech_pairs_SEA, runs_SEA[, .(ID2 = Raw.file, Sample2 = Experiment,
+                    Tech2 = Tech_rep)], by = "ID2")
+tech_pairs_SEA <- tech_pairs_SEA[Experiment == Sample2, .(Experiment, Condition, Sample_order,
+                         Run1 = ID1, Run2 = ID2, Tech1, Tech2, Pearson)]
+setorder(tech_pairs_SEA, Sample_order, Tech1, Tech2)
+tech_cor_summary_SEA <- tech_pairs_SEA[, .(Technical_pairs = .N,
+  Median_Pearson = median(Pearson, na.rm = TRUE), Mean_Pearson = mean(Pearson, na.rm = TRUE),
+  Minimum_Pearson = min(Pearson, na.rm = TRUE)), by = .(Experiment, Condition, Sample_order)]
+
+run_pair_means_SEA <- rbind(tech_pairs_SEA[, .(Raw.file = Run1, Pearson)],
+                        tech_pairs_SEA[, .(Raw.file = Run2, Pearson)])[, .(
+  Mean_within_sample_Pearson = mean(Pearson, na.rm = TRUE)), by = Raw.file]
+run_cov_SEA <- merge(run_cov_SEA, run_pair_means_SEA, by = "Raw.file", all.x = TRUE)
+setorder(run_cov_SEA, Sample_order, Tech_rep)
+
+bio_pairs_SEA <- merge(correlation_pairs_SEA(sample_cor_SEA), samples_SEA[, .(
+  ID1 = Experiment, Condition, Rep1 = Bio_rep)], by = "ID1")
+bio_pairs_SEA <- merge(bio_pairs_SEA, samples_SEA[, .(ID2 = Experiment, Condition2 = Condition,
+  Rep2 = Bio_rep)], by = "ID2")
+bio_pairs_SEA <- bio_pairs_SEA[Condition == Condition2, .(Condition,
+  Sample1 = ID1, Sample2 = ID2, Rep1, Rep2, Pearson)]
+setorder(bio_pairs_SEA, Condition, Rep1, Rep2)
+bio_cor_summary_SEA <- bio_pairs_SEA[, .(Biological_pairs = .N,
+  Median_Pearson = median(Pearson, na.rm = TRUE), Mean_Pearson = mean(Pearson, na.rm = TRUE),
+  Minimum_Pearson = min(Pearson, na.rm = TRUE)), by = Condition]
+setnames(all_run_pairs_SEA, c("ID1", "ID2"), c("Run1", "Run2"))
+knitr::kable(tech_cor_summary_SEA, digits = 3)
+knitr::kable(bio_cor_summary_SEA, digits = 3)
+```
+
+# Peptide coefficients of variation
+
+CV = 100 x sample SD / arithmetic mean, on the normalized linear scale (`2^Norm_log2`). Missing observations are not imputed; peptides observed once have undefined CV.
+
+```{r peptide_cv}
+tech_cv_SEA <- pep_run_SEA[, .(Technical_runs_detected = uniqueN(Raw.file),
+  Mean_intensity = mean(Norm_intensity), SD_intensity = sd(Norm_intensity)),
+  by = .(Experiment, Sequence)]
+tech_cv_SEA[, CV_percent := 100 * SD_intensity / Mean_intensity]
+tech_cv_SEA <- merge(tech_cv_SEA, samples_SEA[, .(Experiment, Condition, Sample_order)], by = "Experiment")
+setorder(tech_cv_SEA, Sample_order, Sequence)
+
+bio_values_SEA <- merge(pep_sample_norm_SEA, sample_map_SEA[, .(Experiment, Condition)], by = "Experiment")
+bio_cv_SEA <- bio_values_SEA[, .(Biological_replicates_detected = uniqueN(Experiment),
+  Mean_intensity = mean(Norm_intensity), SD_intensity = sd(Norm_intensity)),
+  by = .(Condition, Sequence)]
+bio_cv_SEA[, CV_percent := 100 * SD_intensity / Mean_intensity]
+setorder(bio_cv_SEA, Condition, Sequence)
+
+summarize_cv_SEA <- function(data, groups) {
+  data[, .(Peptides_total = .N, Peptides_with_estimable_CV = sum(is.finite(CV_percent)),
+    Median_CV_percent = median(CV_percent, na.rm = TRUE),
+    CV_Q25_percent = quantile(CV_percent, 0.25, na.rm = TRUE),
+    CV_Q75_percent = quantile(CV_percent, 0.75, na.rm = TRUE)), by = groups]
+}
+tech_cv_summary_SEA <- summarize_cv_SEA(tech_cv_SEA, c("Experiment", "Condition", "Sample_order"))
+bio_cv_summary_SEA <- summarize_cv_SEA(bio_cv_SEA, "Condition")
+knitr::kable(tech_cv_summary_SEA, digits = 2)
+knitr::kable(bio_cv_summary_SEA, digits = 2)
+```
+
+# Export QC tables once
+
+
+
+```{r qc_tables}
+qc_summary_SEA <- data.table(
+  Metric = c("Quantified target evidence rows", "Raw files", "Biological samples",
+    "Unique peptide sequences", "Unique leading protein groups", "Overall peptide missingness",
+    "Median technical-pair Pearson after normalization",
+    "Median within-condition biological-pair Pearson after normalization",
+    "Median peptide technical-run CV (%) after normalization",
+    "Median peptide biological-replicate CV (%) after normalization"),
+  Value = c(nrow(evidence_SEA), nrow(runs_SEA), nrow(samples_SEA), uniqueN(evidence_SEA$Sequence),
+    count_groups_SEA(evidence_SEA$Leading.proteins), mean(is.na(raw_mat_SEA)),
+    median(tech_pairs_SEA$Pearson, na.rm = TRUE), median(bio_pairs_SEA$Pearson, na.rm = TRUE),
+    median(tech_cv_SEA$CV_percent, na.rm = TRUE), median(bio_cv_SEA$CV_percent, na.rm = TRUE))
+)
+write_tables_SEA(list(
+  QC_coverage_overall = overall_cov_SEA, QC_coverage_by_condition = condition_cov_SEA,
+  QC_raw_file_metrics = run_cov_SEA, QC_experiment_metrics = sample_cov_SEA,
+  QC_pairwise_raw_file_correlations = all_run_pairs_SEA,
+  QC_technical_replicate_correlations = tech_pairs_SEA,
+  QC_technical_replicate_correlation_summary = tech_cor_summary_SEA,
+  QC_biological_replicate_correlations = bio_pairs_SEA,
+  QC_biological_replicate_correlation_summary = bio_cor_summary_SEA,
+  QC_peptide_technical_CV = tech_cv_SEA, QC_peptide_CV_by_experiment = tech_cv_summary_SEA,
+  QC_peptide_biological_CV = bio_cv_SEA, QC_peptide_CV_by_condition = bio_cv_summary_SEA,
+  QC_integrated_summary = qc_summary_SEA
+), qc_dir_SEA)
+knitr::kable(qc_summary_SEA, digits = 4)
+```
+
+# Save handoffs for later stages
+
+All later analyses use `QC/data/quantification_SEA.rds`. Protein coverage counts distinct leading protein groups, not protein sequence coverage. Correlations use pairwise-complete normalized log2 values; CV uses `2^Norm_log2` with no imputation. Single observations have undefined CV.
+
+```{r save_handoffs}
+quantification_SEA <- list(
+  sample_map = sample_map_SEA, runs = runs_SEA, samples = samples_SEA,
+  raw_log2 = raw_log2_SEA, biological_log2 = sample_log2_SEA,
+  peptide_annotation = peptide_annotation_SEA,
+  n_evidence = nrow(evidence_SEA), filter_summary = filter_summary_SEA,
+  input_files = list(evidence = evidence_file_SEA, protein_groups = protein_groups_file_SEA),
+  qc_status = qc_filter_status_SEA, qc_filter_stages = qc_filter_stages_SEA,
+  qc_coverage_before_after = qc_coverage_before_after_SEA,
+  method = list(modified_signals_included = TRUE, modified_rows_filtered = FALSE,
+    modification_forms_distinguished = FALSE, aggregation_key = "Sequence",
+    only_identified_by_site_groups_removed = TRUE,
+    protein_mapping = "MaxQuant unique-plus-razor assigned protein group; group members retained",
+    evidence_q_max = 0.01, protein_group_q_max = 0.01,
+    biological_replicate_filter_enabled = FALSE,
+    minimum_raw_file_fraction = 0.20,
+    minimum_raw_files_detected = ceiling(0.20 * nrow(runs_SEA)),
+    protein_accession_count_action = "exclude accessions and rows mapped only to excluded accessions",
+    minimum_distinct_peptides_per_accession = 2L,
+    filter_order = "protein peptide support, then peptide raw-file detection; no second protein filter",
+    aggregation = "median of normalized log2 evidence within raw file",
+    normalization = "log2 evidence intensity minus raw-file evidence median",
+    technical_aggregation = "median of available technical-run log2 values",
+    modification_specific_quantification = FALSE)
+)
+saveRDS(quantification_SEA, file.path(paths_SEA$data, "quantification_SEA.rds"))
+saveRDS(list(pep_run = pep_run_SEA[, .(Raw.file, Peptide_intensity)],
+  runs = runs_SEA, samples = samples_SEA, run_cov = run_cov_SEA, sample_cov = sample_cov_SEA,
+  raw_order = raw_order_SEA, sample_order = sample_order_SEA,
+  run_cor = run_cor_SEA, sample_cor = sample_cor_SEA,
+  qc_coverage_before_after = qc_coverage_before_after_SEA,
+  qc_filter_stages = qc_filter_stages_SEA),
+  file.path(paths_SEA$data, "QC_plot_data_SEA.rds"))
+save_session_SEA(paths_SEA$root)
+```

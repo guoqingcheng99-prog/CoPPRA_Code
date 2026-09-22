@@ -1,0 +1,262 @@
+---
+title: "3.1 CoPPRA SEA limma analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 1.1 (or in the numbered series). Carriers are excluded. The saved normalized matrix is used directly. As in v3, missing values are replaced with each peptide median only in the limma input; median effect sizes use observed biological values. Calls retain raw P < 0.05 and absolute median log2 fold change > 1. BH-adjusted P values are also exported. Protein calls mean at least one mapped peptide passes; RU-only calls require `RU_sig & !Ru_sig & !Ul_sig`.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(limma)
+```
+
+
+# Read shared quantification
+
+
+
+```{r read_quantification}
+paths_SEA <- stage_paths_SEA("Limma")
+table_folder_SEA <- paths_SEA$tables
+pval_threshold_SEA <- 0.05
+log2fc_threshold_SEA <- log2(2)
+q_SEA <- readRDS(file.path(output_root_SEA, "QC", "data", "quantification_SEA.rds"))
+analysis_meta_SEA <- copy(q_SEA$sample_map[Condition != "Carrier"])
+model_labels_SEA <- c(Ctrl = "Control", R = "Ru", U = "Ul", RU = "RU")
+analysis_meta_SEA[, Condition := factor(model_labels_SEA[as.character(Condition)],
+                                    levels = c("Control", "Ru", "Ul", "RU"))]
+setorder(analysis_meta_SEA, Condition, Bio_rep)
+analysis_samples_SEA <- analysis_meta_SEA$Experiment
+peptide_annotation_SEA <- q_SEA$peptide_annotation
+peptide_matrix_SEA <- q_SEA$biological_log2[, analysis_samples_SEA, drop = FALSE]
+fwrite(analysis_meta_SEA, file.path(table_folder_SEA, "differential_sample_metadata_SEA.csv"))
+```
+
+# Fit limma contrasts
+
+
+
+```{r limma_analysis}
+row_medians_SEA <- rowMedians(peptide_matrix_SEA, na.rm = TRUE)
+finite_rows_SEA <- is.finite(row_medians_SEA)
+
+peptide_matrix_SEA <- peptide_matrix_SEA[finite_rows_SEA, , drop = FALSE]
+row_medians_SEA <- row_medians_SEA[finite_rows_SEA]
+
+limma_matrix_SEA <- peptide_matrix_SEA
+missing_index_SEA <- which(!is.finite(limma_matrix_SEA), arr.ind = TRUE)
+limma_matrix_SEA[missing_index_SEA] <- row_medians_SEA[missing_index_SEA[, 1]]
+
+condition_SEA <- analysis_meta_SEA$Condition
+design_SEA <- model.matrix(~ 0 + condition_SEA)
+colnames(design_SEA) <- levels(condition_SEA)
+rownames(design_SEA) <- analysis_samples_SEA
+
+contrast_matrix_SEA <- makeContrasts(
+  Ru_vs_Control = Ru - Control,
+  Ul_vs_Control = Ul - Control,
+  RU_vs_Control = RU - Control,
+  levels = design_SEA
+)
+
+fit_SEA <- lmFit(limma_matrix_SEA, design_SEA)
+fit_SEA <- contrasts.fit(fit_SEA, contrast_matrix_SEA)
+fit_SEA <- eBayes(fit_SEA)
+
+peptide_results_SEA <- data.table(
+  Sequence = rownames(limma_matrix_SEA)
+)
+
+contrast_results_SEA <- lapply(colnames(contrast_matrix_SEA), function(contrast_name) {
+  result <- as.data.table(
+    topTable(
+      fit_SEA,
+      coef = contrast_name,
+      number = Inf,
+      sort.by = "none",
+      adjust.method = "BH"
+    ),
+    keep.rownames = "Sequence"
+  )
+
+  result <- result[, .(Sequence, logFC, P.Value, adj.P.Val)]
+  setnames(
+    result,
+    c("logFC", "P.Value", "adj.P.Val"),
+    paste0(
+      contrast_name,
+      c("_limma_logFC", "_pvalue", "_adj.P.Val")
+    )
+  )
+  result
+})
+
+peptide_results_SEA <- Reduce(
+  function(x, y) merge(x, y, by = "Sequence"),
+  c(list(peptide_results_SEA), contrast_results_SEA)
+)
+
+fwrite(
+  peptide_results_SEA,
+  file.path(table_folder_SEA, "peptide_limma_results_SEA.csv")
+)
+
+cat("Total peptides tested:", nrow(peptide_results_SEA), "\n")
+```
+
+# Calculate median effects and peptide calls
+
+
+
+```{r peptide_significance}
+condition_samples_SEA <- split(analysis_meta_SEA$Experiment, analysis_meta_SEA$Condition)
+condition_medians_SEA <- lapply(condition_samples_SEA, function(samples_SEA) {
+  matrixStats::rowMedians(peptide_matrix_SEA[, samples_SEA, drop = FALSE], na.rm = TRUE)
+})
+peptide_effects_SEA <- data.table(Sequence = rownames(peptide_matrix_SEA))
+for (contrast in c("Ru", "Ul", "RU")) {
+  peptide_effects_SEA[, (paste0(contrast, "_log2FC")) :=
+    condition_medians_SEA[[contrast]] - condition_medians_SEA$Control]
+}
+peptide_significance_SEA <- merge(peptide_results_SEA, peptide_effects_SEA, by = "Sequence")
+peptide_significance_SEA <- merge(peptide_significance_SEA, peptide_annotation_SEA, by = "Sequence", all.x = TRUE)
+for (contrast in c("Ru", "Ul", "RU")) {
+  p_value <- peptide_significance_SEA[[paste0(contrast, "_vs_Control_pvalue")]]
+  effect <- peptide_significance_SEA[[paste0(contrast, "_log2FC")]]
+  peptide_significance_SEA[, (paste0(contrast, "_sig")) :=
+    is.finite(p_value) & is.finite(effect) &
+    p_value < pval_threshold_SEA & abs(effect) > log2fc_threshold_SEA]
+}
+significant_peptides_SEA <- peptide_significance_SEA[Ru_sig | Ul_sig | RU_sig]
+write_tables_SEA(list(all_peptide_differential_results = peptide_significance_SEA,
+                 significant_peptides = significant_peptides_SEA,
+                 peptide_biological_matrix = matrix_table_SEA(peptide_matrix_SEA),
+                 peptide_limma_matrix_used = matrix_table_SEA(limma_matrix_SEA)), table_folder_SEA)
+```
+
+# Collapse peptide calls to protein accessions
+
+
+
+```{r protein_collapse}
+protein_significance_SEA <- peptide_significance_SEA %>%
+  dplyr::as_tibble() %>%
+  dplyr::filter(!is.na(Proteins), Proteins != "") %>%
+  dplyr::mutate(ProteinGroup = Proteins) %>%
+  tidyr::separate_rows(Proteins, sep = ";") %>%
+  dplyr::mutate(ProteinID = trimws(Proteins)) %>%
+  dplyr::filter(ProteinID != "") %>%
+  dplyr::distinct(Sequence, ProteinID, .keep_all = TRUE) %>%
+  dplyr::group_by(ProteinID) %>%
+  dplyr::summarise(
+    Ru_sig = any(Ru_sig, na.rm = TRUE),
+    Ul_sig = any(Ul_sig, na.rm = TRUE),
+    RU_sig = any(RU_sig, na.rm = TRUE),
+    ProteinGroups = paste(unique(ProteinGroup), collapse = " | "),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(Ru_sig | Ul_sig | RU_sig)
+
+conjunctional_proteins_SEA <- protein_significance_SEA %>%
+  dplyr::filter(RU_sig & !Ru_sig & !Ul_sig)
+
+fwrite(
+  as.data.table(protein_significance_SEA),
+  file.path(table_folder_SEA, "significant_proteins_SEA.csv")
+)
+fwrite(
+  as.data.table(conjunctional_proteins_SEA),
+  file.path(table_folder_SEA, "conjunctional_targeting_proteins_SEA.csv")
+)
+
+protein_count_summary_SEA <- data.table(
+  Set = c("R", "U", "RU", "RU only / conjunctional"),
+  Significant_proteins = c(
+    sum(protein_significance_SEA$Ru_sig),
+    sum(protein_significance_SEA$Ul_sig),
+    sum(protein_significance_SEA$RU_sig),
+    nrow(conjunctional_proteins_SEA)
+  )
+)
+
+knitr::kable(
+  protein_count_summary_SEA,
+  caption = "Significant proteins by set"
+)
+```
+
+# Calculate intersection tables
+
+
+
+```{r intersection_tables}
+make_intersection_table_SEA <- function(data, set_columns) {
+  data %>%
+    dplyr::select(ProteinID, dplyr::all_of(set_columns)) %>%
+    dplyr::filter(
+      dplyr::if_any(dplyr::all_of(set_columns), identity)
+    ) %>%
+    tidyr::pivot_longer(
+      cols = -ProteinID,
+      names_to = "Comparison",
+      values_to = "Significant"
+    ) %>%
+    dplyr::filter(Significant) %>%
+    dplyr::mutate(Comparison = sub("_sig", "", Comparison)) %>%
+    dplyr::group_by(ProteinID) %>%
+    dplyr::summarise(
+      Sets = paste(sort(Comparison), collapse = "_"),
+      .groups = "drop"
+    ) %>%
+    dplyr::group_by(Sets) %>%
+    dplyr::summarise(
+      n_proteins = dplyr::n(),
+      Proteins = paste(ProteinID, collapse = ";"),
+      .groups = "drop"
+    )
+}
+
+protein_intersections_SEA <- make_intersection_table_SEA(
+  protein_significance_SEA,
+  c("Ru_sig", "RU_sig", "Ul_sig")
+)
+
+fwrite(
+  as.data.table(protein_intersections_SEA),
+  file.path(table_folder_SEA, "significant_intersections_SEA.csv")
+)
+
+knitr::kable(
+  protein_intersections_SEA,
+  caption = "Protein intersections represented in the UpSet plot"
+)
+```
+
+# Save results
+
+
+
+```{r save_limma}
+analysis_summary_SEA <- data.table(
+  Metric = c("Evidence rows", "Peptides tested by limma", "Significant peptides",
+             "Significant proteins", "RU-only conjunctional proteins"),
+  Value = c(q_SEA$n_evidence, nrow(peptide_results_SEA), nrow(significant_peptides_SEA),
+            nrow(protein_significance_SEA), nrow(conjunctional_proteins_SEA))
+)
+write_tables_SEA(list(differential_analysis_summary = analysis_summary_SEA,
+                 significant_protein_counts = protein_count_summary_SEA), table_folder_SEA)
+saveRDS(list(peptide_significance = peptide_significance_SEA,
+  protein_significance = protein_significance_SEA,
+  pval_threshold = pval_threshold_SEA, log2fc_threshold = log2fc_threshold_SEA),
+  file.path(paths_SEA$data, "Limma_results_SEA.rds"))
+saveRDS(fit_SEA, file.path(paths_SEA$data, "limma_fit_SEA.rds"))
+save_session_SEA(paths_SEA$root)
+knitr::kable(analysis_summary_SEA)
+```

@@ -1,0 +1,132 @@
+---
+title: "2.1 CoPPRA PCA analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 1.1. Use the saved biological peptide matrix, including carriers. Retain peptides observed in at least two biological samples and replace remaining missing values with the peptide median only for PCA. Samples are observations; peptides are centered, unscaled variables.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(matrixStats)
+library(PCAtools)
+```
+
+
+# Read and prepare the PCA matrix
+
+
+
+```{r prepare_matrix}
+paths <- stage_paths("PCA")
+table_folder <- paths$tables
+q <- readRDS(file.path(output_root, "QC", "data", "quantification.rds"))
+sample_map <- copy(q$sample_map)
+sample_map[, PCA_group := factor(as.character(Condition),
+  levels = c("Ctrl", "R", "U", "RU", "Carrier"))]
+sample_map[, Experiment_order := order(order(PCA_group, Bio_rep))]
+sample_map[, Biological_replicate := Bio_rep]
+setorder(sample_map, Experiment_order)
+pca_samples <- sample_map$Experiment
+pca_source <- q$biological_log2[, pca_samples, drop = FALSE]
+pca_matrix <- pca_source[rowSums(is.finite(pca_source)) >= 2L, , drop = FALSE]
+peptide_medians <- matrixStats::rowMedians(pca_matrix, na.rm = TRUE)
+missing_index <- which(!is.finite(pca_matrix), arr.ind = TRUE)
+pca_matrix[missing_index] <- peptide_medians[missing_index[, 1]]
+fwrite(matrix_table(pca_matrix), file.path(table_folder, "PCA_peptide_matrix_used.csv"))
+fwrite(sample_map, file.path(table_folder, "PCA_group_classification.csv"))
+```
+
+# Calculate PCA
+
+
+
+```{r run_pca}
+pca_metadata <- sample_map[, .(
+  label = Experiment,
+  PCA_group,
+  Biological_replicate
+)]
+
+pca_metadata_df <- as.data.frame(pca_metadata)
+rownames(pca_metadata_df) <- pca_metadata_df$label
+
+pca_result <- PCAtools::pca(
+  pca_matrix,
+  metadata = pca_metadata_df,
+  removeVar = 0,
+  center = TRUE,
+  scale = FALSE
+)
+
+pca_scores <- as.data.table(
+  pca_result$rotated,
+  keep.rownames = "label"
+)
+pca_scores <- merge(
+  pca_scores,
+  pca_metadata,
+  by = "label",
+  sort = FALSE
+)
+pca_scores[, Experiment_order := match(label, pca_samples)]
+setorder(pca_scores, Experiment_order)
+
+pca_variance <- data.table(
+  PC = paste0("PC", seq_along(pca_result$variance)),
+  PC_number = seq_along(pca_result$variance),
+  Variance_percent = as.numeric(pca_result$variance),
+  Cumulative_variance_percent = cumsum(
+    as.numeric(pca_result$variance)
+  )
+)
+
+n_pc_95 <- which(
+  pca_variance$Cumulative_variance_percent >= 95
+)[1]
+pca_variance_95 <- pca_variance[seq_len(n_pc_95)]
+
+fwrite(
+  pca_scores,
+  file.path(table_folder, "PCA_peptide_scores.csv")
+)
+fwrite(
+  pca_variance,
+  file.path(table_folder, "PCA_peptide_variance_all_PCs.csv")
+)
+fwrite(
+  pca_variance_95,
+  file.path(table_folder, "PCA_peptide_variance_first_95pct.csv")
+)
+
+cat(
+  "Number of first PCs needed to explain at least 95% variance:",
+  n_pc_95,
+  "\n"
+)
+knitr::kable(
+  pca_variance_95,
+  digits = 2,
+  caption = "First principal components explaining at least 95% variance"
+)
+```
+
+# Save PCA results
+
+
+
+```{r save_pca}
+pca_summary <- data.table(
+  Metric = c("Evidence rows", "PCA peptides", "Biological samples", "PC1 variance (%)", "PC2 variance (%)"),
+  Value = c(q$n_evidence, nrow(pca_matrix), ncol(pca_matrix), pca_variance$Variance_percent[1:2])
+)
+fwrite(pca_summary, file.path(table_folder, "PCA_analysis_summary.csv"))
+saveRDS(list(pca_scores = pca_scores, pca_variance = pca_variance,
+            pca_variance_95 = pca_variance_95), file.path(paths$data, "PCA_plot_data.rds"))
+saveRDS(pca_result, file.path(paths$data, "PCA_result.rds"))
+save_session(paths$root)
+knitr::kable(pca_summary)
+```

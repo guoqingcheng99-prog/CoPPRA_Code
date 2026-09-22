@@ -1,0 +1,409 @@
+---
+title: "4.1 CoPPRA SEA biological concept analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 3.1. Rank proteins using median peptide signed normal scores from limma logFC and raw P values, then run GO BP/MF/CC and KEGG GSEA separately for R, U and RU. Operational CT concepts pass BH-adjusted P < 0.10 in RU and are nonsignificant or unavailable in both single treatments. This is an operational comparison, not an interaction test. KEGG requires internet access. Packages must be installed before running the series.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+```
+
+
+# Read limma results and set parameters
+
+
+
+```{r read_results}
+paths_SEA <- stage_paths_SEA("Biological_Concept")
+table_folder_SEA <- paths_SEA$tables
+minimum_pathway_size_SEA <- 10
+maximum_pathway_size_SEA <- 500
+adjusted_p_cutoff_SEA <- 0.10
+minimum_term_similarity_SEA <- 0.20
+show_category_SEA <- 12
+set.seed(20260908)
+peptide_results_SEA <- copy(readRDS(file.path(output_root_SEA, "Limma", "data",
+                                         "Limma_results_SEA.rds"))$peptide_significance)
+```
+
+# Calculate protein scores
+
+
+
+```{r protein_scores}
+signed_z_SEA <- function(log_fc, p_value) {
+  # Keep unavailable statistics unavailable; only clamp finite P values at zero.
+  p_value <- pmin(pmax(p_value, .Machine$double.xmin), 1)
+  sign(log_fc) * stats::qnorm(p_value / 2, lower.tail = FALSE)
+}
+
+peptide_results_SEA[, `:=`(
+  Ru_score = signed_z_SEA(
+    Ru_vs_Control_limma_logFC,
+    Ru_vs_Control_pvalue
+  ),
+  Ul_score = signed_z_SEA(
+    Ul_vs_Control_limma_logFC,
+    Ul_vs_Control_pvalue
+  ),
+  RU_score = signed_z_SEA(
+    RU_vs_Control_limma_logFC,
+    RU_vs_Control_pvalue
+  )
+)]
+
+protein_score_long_SEA <- peptide_results_SEA[
+  !is.na(Proteins) & Proteins != "",
+  .(
+    ProteinID = trimws(unlist(strsplit(
+      Proteins,
+      ";",
+      fixed = TRUE
+    )))
+  ),
+  by = .(
+    Sequence,
+    Ru_score,
+    Ul_score,
+    RU_score
+  )
+]
+
+protein_score_long_SEA <- unique(protein_score_long_SEA[ProteinID != ""], by = c("Sequence", "ProteinID"))
+
+protein_scores_SEA <- protein_score_long_SEA[, .(
+  n_peptides = uniqueN(Sequence),
+  R_score = median(Ru_score, na.rm = TRUE),
+  U_score = median(Ul_score, na.rm = TRUE),
+  RU_score = median(RU_score, na.rm = TRUE)
+), by = ProteinID]
+
+protein_scores_SEA[, UniProt := sub("-\\d+$", "", ProteinID)]
+
+cat("Protein accessions with ranking scores:", nrow(protein_scores_SEA), "\n")
+```
+
+# Map UniProt to Entrez IDs
+
+
+
+```{r protein_mapping}
+uniprot_ids_SEA <- unique(protein_scores_SEA$UniProt)
+
+id_map_SEA <- clusterProfiler::bitr(
+  uniprot_ids_SEA,
+  fromType = "UNIPROT",
+  toType = c("ENTREZID", "SYMBOL"),
+  OrgDb = org.Hs.eg.db
+) %>%
+  dplyr::distinct(UNIPROT, ENTREZID, SYMBOL)
+
+protein_scores_mapped_SEA <- protein_scores_SEA %>%
+  dplyr::inner_join(
+    id_map_SEA,
+    by = c("UniProt" = "UNIPROT")
+  ) %>%
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(
+    SYMBOL = paste(sort(unique(SYMBOL)), collapse = ";"),
+    UniProt = paste(sort(unique(UniProt)), collapse = ";"),
+    n_accessions = dplyr::n_distinct(ProteinID),
+    n_peptides = sum(n_peptides),
+    R_score = median(R_score, na.rm = TRUE),
+    U_score = median(U_score, na.rm = TRUE),
+    RU_score = median(RU_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  id_map_SEA,
+  file.path(table_folder_SEA, "uniprot_to_entrez_mapping_SEA.csv")
+)
+
+readr::write_csv(
+  protein_scores_mapped_SEA,
+  file.path(table_folder_SEA, "protein_rank_scores_SEA.csv")
+)
+
+mapping_summary_SEA <- tibble::tibble(
+  Metric = c(
+    "Protein accessions before mapping",
+    "Mapped Entrez IDs used for ranking"
+  ),
+  Value = c(
+    nrow(protein_scores_SEA),
+    nrow(protein_scores_mapped_SEA)
+  )
+)
+
+readr::write_csv(
+  mapping_summary_SEA,
+  file.path(table_folder_SEA, "ranking_mapping_summary_SEA.csv")
+)
+
+print(mapping_summary_SEA)
+```
+
+# Build ranked lists
+
+
+
+```{r ranked_lists}
+make_ranked_list_SEA <- function(data, score_column) {
+  score <- data[[score_column]]
+  names(score) <- as.character(data$ENTREZID)
+
+  score <- score[is.finite(score) & !is.na(names(score))]
+
+  tie_break <- rank(
+    names(score),
+    ties.method = "first"
+  ) / length(score)
+
+  score <- score + tie_break * 1e-12
+  sort(score, decreasing = TRUE)
+}
+
+ranked_lists_SEA <- list(
+  R = make_ranked_list_SEA(protein_scores_mapped_SEA, "R_score"),
+  U = make_ranked_list_SEA(protein_scores_mapped_SEA, "U_score"),
+  RU = make_ranked_list_SEA(protein_scores_mapped_SEA, "RU_score")
+)
+
+rank_summary_SEA <- tibble::tibble(
+  Contrast = names(ranked_lists_SEA),
+  n_ranked_proteins = vapply(ranked_lists_SEA, length, integer(1)),
+  minimum_score = vapply(ranked_lists_SEA, min, numeric(1)),
+  maximum_score = vapply(ranked_lists_SEA, max, numeric(1))
+)
+
+readr::write_csv(
+  rank_summary_SEA,
+  file.path(table_folder_SEA, "ranked_list_summary_SEA.csv")
+)
+
+print(rank_summary_SEA)
+```
+
+# Run GSEA
+
+
+
+```{r gsea}
+make_readable_gsea_SEA <- function(x) {
+  if (is.null(x)) stop("GSEA returned NULL; inspect gene mapping and gene-set overlap.")
+  if (nrow(x@result) == 0L) return(x)
+
+  clusterProfiler::setReadable(
+    x,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID"
+  )
+}
+
+run_gse_go_SEA <- function(gene_list, ont) {
+  x <- clusterProfiler::gseGO(
+    geneList = gene_list,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = ont,
+    minGSSize = minimum_pathway_size_SEA,
+    maxGSSize = maximum_pathway_size_SEA,
+    pvalueCutoff = 1,
+    pAdjustMethod = "BH",
+    eps = 0,
+    seed = TRUE,
+    by = "fgsea",
+    verbose = FALSE
+  )
+
+  make_readable_gsea_SEA(x)
+}
+
+run_gse_kegg_SEA <- function(gene_list) {
+  x <- clusterProfiler::gseKEGG(
+    geneList = gene_list,
+    organism = "hsa",
+    keyType = "ncbi-geneid",
+    minGSSize = minimum_pathway_size_SEA,
+    maxGSSize = maximum_pathway_size_SEA,
+    pvalueCutoff = 1,
+    pAdjustMethod = "BH",
+    eps = 0,
+    seed = TRUE,
+    by = "fgsea",
+    verbose = FALSE
+  )
+
+  make_readable_gsea_SEA(x)
+}
+
+run_for_contrasts_SEA <- function(fun, ...) {
+  out <- lapply(ranked_lists_SEA, fun, ...)
+  names(out) <- names(ranked_lists_SEA)
+  out
+}
+
+gsea_results_SEA <- list(
+  GO_BP = run_for_contrasts_SEA(run_gse_go_SEA, ont = "BP"),
+  GO_MF = run_for_contrasts_SEA(run_gse_go_SEA, ont = "MF"),
+  GO_CC = run_for_contrasts_SEA(run_gse_go_SEA, ont = "CC"),
+  KEGG = run_for_contrasts_SEA(run_gse_kegg_SEA)
+)
+```
+
+# Export all contrasts
+
+
+
+```{r full_tables}
+for (database_name in names(gsea_results_SEA)) {
+  for (contrast_name in names(gsea_results_SEA[[database_name]])) {
+    x <- gsea_results_SEA[[database_name]][[contrast_name]]
+
+    readr::write_csv(
+      as.data.frame(x),
+      file.path(
+        table_folder_SEA,
+        paste0(
+          database_name,
+          "_",
+          contrast_name,
+          "_all_GSEA_SEA.csv"
+        )
+      )
+    )
+  }
+}
+```
+
+# Identify operational CT concepts
+
+
+
+```{r conjunctional_concepts}
+extract_contrast_result_SEA <- function(x, contrast_name) {
+  result <- as.data.frame(x)
+
+  if (nrow(result) == 0L) {
+    result <- data.frame(ID = character(), Description = character(), setSize = integer(),
+      NES = numeric(), pvalue = numeric(), p.adjust = numeric(), core_enrichment = character())
+  }
+
+  result %>%
+    dplyr::select(
+      ID,
+      Description,
+      setSize,
+      NES,
+      pvalue,
+      p.adjust,
+      core_enrichment
+    ) %>%
+    dplyr::rename_with(
+      ~paste0(.x, "_", contrast_name),
+      -ID
+    )
+}
+
+find_conjunctional_concepts_SEA <- function(result_list) {
+  r_only <- extract_contrast_result_SEA(result_list$R, "R")
+  u_only <- extract_contrast_result_SEA(result_list$U, "U")
+  combo <- extract_contrast_result_SEA(result_list$RU, "RU")
+
+  dplyr::full_join(r_only, u_only, by = "ID") %>%
+    dplyr::full_join(combo, by = "ID") %>%
+    dplyr::filter(
+      !is.na(p.adjust_RU),
+      p.adjust_RU < adjusted_p_cutoff_SEA,
+      is.na(p.adjust_R) | p.adjust_R >= adjusted_p_cutoff_SEA,
+      is.na(p.adjust_U) | p.adjust_U >= adjusted_p_cutoff_SEA
+    ) %>%
+    dplyr::arrange(p.adjust_RU, dplyr::desc(abs(NES_RU)))
+}
+
+conjunctional_concepts_SEA <- lapply(
+  gsea_results_SEA,
+  find_conjunctional_concepts_SEA
+)
+
+concept_summary_SEA <- tibble::tibble(
+  Database = names(conjunctional_concepts_SEA),
+  n_conjunctional_concepts = vapply(
+    conjunctional_concepts_SEA,
+    nrow,
+    integer(1)
+  )
+)
+
+for (database_name in names(conjunctional_concepts_SEA)) {
+  readr::write_csv(
+    conjunctional_concepts_SEA[[database_name]],
+    file.path(
+      table_folder_SEA,
+      paste0(
+        database_name,
+        "_operational_conjunctional_targeting_SEA.csv"
+      )
+    )
+  )
+}
+
+readr::write_csv(
+  concept_summary_SEA,
+  file.path(table_folder_SEA, "conjunctional_targeting_summary_SEA.csv")
+)
+
+print(concept_summary_SEA)
+```
+
+# Prepare network inputs and save results
+
+
+
+```{r save_biology}
+# Select plotting inputs and calculate term similarities here, once.
+plot_inputs_SEA <- lapply(names(gsea_results_SEA), function(database_name) {
+  result_list <- gsea_results_SEA[[database_name]]
+  selected <- lapply(result_list, function(x) {
+    x@result <- x@result[!is.na(x@result$p.adjust) &
+                          x@result$p.adjust < adjusted_p_cutoff_SEA, , drop = FALSE]
+    x
+  })
+  ct <- result_list$RU
+  ct@result <- ct@result[ct@result$ID %in% conjunctional_concepts_SEA[[database_name]]$ID, , drop = FALSE]
+  selected$CT <- ct
+  lapply(selected, function(x) {
+    if (nrow(x@result) >= 2L) {
+      x <- enrichplot::pairwise_termsim(x, method = "JC",
+        showCategory = min(200L, nrow(x@result)))
+    }
+    x
+  })
+})
+names(plot_inputs_SEA) <- names(gsea_results_SEA)
+saveRDS(list(gsea_results = gsea_results_SEA, conjunctional_concepts = conjunctional_concepts_SEA,
+            ranked_lists = ranked_lists_SEA), file.path(paths_SEA$data, "Biological_Concept_results_SEA.rds"))
+saveRDS(list(plot_inputs = plot_inputs_SEA, show_category = show_category_SEA,
+            minimum_term_similarity = minimum_term_similarity_SEA),
+        file.path(paths_SEA$data, "Biological_Concept_plot_data_SEA.rds"))
+writeLines(c(paste("Run date:", Sys.Date()),
+  "GSEA: fgsea; GO: installed org.Hs.eg.db; KEGG: live hsa gene sets",
+  "Gene-set size 10-500; BH-adjusted P < 0.10 within database and contrast",
+  "Operational CT: RU significant; R and U nonsignificant or unavailable",
+  "Term similarity: Jaccard; minimum edge similarity 0.20",
+  "Seed: 20260908"), file.path(paths_SEA$root, "analysis_parameters_SEA.txt"))
+save_session_SEA(paths_SEA$root)
+```

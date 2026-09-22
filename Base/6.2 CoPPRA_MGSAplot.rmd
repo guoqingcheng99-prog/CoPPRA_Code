@@ -1,0 +1,142 @@
+---
+title: "6.2 CoPPRA MGSA plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 6.1. Draw saved R, U, RU and CT results as dot plots, gene-term networks and enrichment maps. MGSA, mapping and term similarities are not recalculated. Colors show posterior probabilities. Each figure is saved as PNG and PDF in a separate group folder under `Results/MGSA_plots`.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+```
+
+# Read prepared plotting inputs
+
+```{r read_plot_data}
+data_folder <- file.path(output_root, "MGSA", "data")
+list2env(readRDS(file.path(data_folder, "MGSA_plot_data.rds")), envir = environment())
+plot_folder <- file.path(output_root, "MGSA_plots")
+plot_groups <- c("R", "U", "RU", "CT")
+plot_group_folders <- setNames(file.path(plot_folder, plot_groups), plot_groups)
+invisible(lapply(plot_group_folders, dir.create, recursive = TRUE, showWarnings = FALSE))
+set.seed(mgsa_seed)
+```
+
+# Plot helpers
+
+```{r plot_helpers}
+panel_theme <- theme(plot.background = element_rect(fill = "white", color = NA),
+  panel.background = element_rect(fill = "white", color = NA),
+  legend.background = element_rect(fill = "white", color = NA),
+  plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+  plot.title.position = "plot", plot.margin = margin(12, 30, 12, 12))
+
+empty_panel <- function(title, reason) {
+  ggplot() + theme_void() + labs(title = title, subtitle = reason) + panel_theme
+}
+
+wrap_label <- function(x) vapply(x, function(z) paste(strwrap(z, width = 30), collapse = "\n"), character(1))
+
+posterior_colors <- function() {
+  scale_color_gradient(low = "#3B83BD", high = "#E6615F",
+    limits = c(posterior_cutoff, 1), name = "Posterior")
+}
+
+make_dot_panel <- function(x, title) {
+  terms <- head(x$terms, show_category)
+  if (!nrow(terms)) return(empty_panel(title, "No terms passed the posterior and measured-size criteria"))
+  terms <- terms[order(terms$posterior), ]
+  terms$PlotID <- factor(terms$ID, levels = terms$ID)
+  ggplot(terms, aes(posterior, PlotID, size = inStudySet, color = posterior)) +
+    geom_point() + scale_y_discrete(labels = setNames(wrap_label(terms$Description), terms$ID)) +
+    scale_x_continuous(limits = c(posterior_cutoff, 1), breaks = seq(posterior_cutoff, 1, 0.1)) +
+    posterior_colors() + scale_size_continuous(name = "Observed genes") +
+    labs(title = title, x = "Posterior probability of term activity", y = NULL) +
+    theme_classic(base_size = 11) + panel_theme
+}
+
+make_cnet_panel <- function(x, title) {
+  terms <- head(x$terms, show_category)
+  if (!nrow(terms)) return(empty_panel(title, "No terms passed the posterior and measured-size criteria"))
+  edges <- dplyr::bind_rows(lapply(terms$ID, function(id) {
+    genes <- x$hits[[id]]
+    if (!length(genes)) return(data.frame(from = character(), to = character()))
+    data.frame(from = rep(paste0("term::", id), length(genes)), to = paste0("gene::", genes))
+  }))
+  if (!nrow(edges)) return(empty_panel(title, "Selected terms contain no observed genes"))
+  gene_ids <- unique(sub("^gene::", "", edges$to))
+  term_nodes <- data.frame(name = paste0("term::", terms$ID), label = wrap_label(terms$Description),
+    type = "Term", posterior = terms$posterior, observed = terms$inStudySet)
+  gene_labels <- unname(symbol_lookup[gene_ids])
+  gene_labels[is.na(gene_labels) | gene_labels == ""] <- gene_ids[is.na(gene_labels) | gene_labels == ""]
+  gene_nodes <- data.frame(name = paste0("gene::", gene_ids), label = gene_labels,
+    type = "Gene", posterior = NA_real_, observed = NA_real_)
+  graph <- igraph::graph_from_data_frame(edges, directed = FALSE,
+    vertices = dplyr::bind_rows(term_nodes, gene_nodes))
+  ggraph(graph, layout = "kk") +
+    geom_edge_link(color = "grey80", linewidth = 0.35, alpha = 0.7) +
+    geom_node_point(data = function(z) z[z$type == "Gene", ], color = "grey65", size = 1.5) +
+    geom_node_point(data = function(z) z[z$type == "Term", ], aes(size = observed, color = posterior)) +
+    geom_node_text(data = function(z) z[z$type == "Term", ], aes(label = label),
+      repel = TRUE, size = 3.4, max.overlaps = Inf, seed = mgsa_seed) +
+    posterior_colors() + scale_size_continuous(name = "Observed genes", range = c(4, 10)) +
+    labs(title = title) + theme_void(base_size = 11) + panel_theme
+}
+
+make_emap_panel <- function(x, title, layout) {
+  terms <- head(x$terms, show_category)
+  if (nrow(terms) < 2L) return(empty_panel(title, "At least two selected terms are required"))
+  sim <- x$similarity[terms$ID, terms$ID, drop = FALSE]
+  selected_edges <- which(upper.tri(sim) & sim >= minimum_term_similarity, arr.ind = TRUE)
+  edges <- data.frame(from = rownames(sim)[selected_edges[, 1]],
+    to = colnames(sim)[selected_edges[, 2]], similarity = sim[selected_edges])
+  nodes <- data.frame(name = terms$ID, label = wrap_label(terms$Description),
+    posterior = terms$posterior, observed = terms$inStudySet)
+  graph <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = nodes)
+  # Keep disconnected selected terms visible; edge-free graphs use a circle.
+  layout <- if (nrow(edges)) layout else "circle"
+  p <- ggraph(graph, layout = layout) +
+    geom_edge_link(aes(width = similarity), color = "grey75", show.legend = FALSE) +
+    scale_edge_width(range = c(0.4, 2)) +
+    geom_node_point(aes(size = observed, color = posterior)) +
+    geom_node_text(aes(label = label), repel = TRUE, size = 3.4,
+      max.overlaps = Inf, seed = mgsa_seed) +
+    posterior_colors() + scale_size_continuous(name = "Observed genes", range = c(4, 10)) +
+    labs(title = title) + theme_void(base_size = 11) + panel_theme
+  xr <- range(p$data$x); yr <- range(p$data$y)
+  span <- max(diff(xr), diff(yr), 1)
+  p + coord_fixed(xlim = mean(xr) + c(-0.7, 0.7) * span,
+                  ylim = mean(yr) + c(-0.7, 0.7) * span, clip = "off")
+}
+```
+
+# Draw all groups
+
+```{r draw_plots}
+database_titles <- c(GO_BP = "GO Biological Process", GO_MF = "GO Molecular Function",
+                     GO_CC = "GO Cellular Component", KEGG = "KEGG Pathways")
+for (group in plot_groups) {
+  for (database in names(plot_inputs)) {
+    x <- plot_inputs[[database]][[group]]
+    prefix <- paste(group, database_titles[[database]])
+    panels <- list(
+      dotplot = make_dot_panel(x, paste(prefix, "Dot Plot")),
+      cnet = make_cnet_panel(x, paste(prefix, "Gene-Term Network")),
+      emap = make_emap_panel(x, paste(prefix, "Enrichment Map"),
+        layout = if (database == "KEGG") "fr" else "kk")
+    )
+    for (kind in names(panels)) {
+      save_plot(panels[[kind]], paste(database, group, kind, sep = "_"),
+                7, 5.5, folder = plot_group_folders[[group]])
+    }
+  }
+}
+save_session(plot_folder)
+```

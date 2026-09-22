@@ -1,0 +1,136 @@
+---
+title: "7.2 CoPPRA topGO biological concept plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 7.1. GO uses classic topGO KS statistics; KEGG retains GSEA NES. GO network genes and dot sizes represent measured term members, while KEGG networks use the saved leading-edge genes. Draw saved R, U, RU and CT results as dot plots, gene-term networks and enrichment maps. Tests, mapping and term similarities are not recalculated. Only guards for empty results, insufficient network nodes and degenerate network layouts are retained. Other plotting errors are reported rather than silently replaced with blank figures.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(ggplot2)
+library(enrichplot)
+library(org.Hs.eg.db)
+```
+
+
+# Read prepared plot inputs
+
+
+
+```{r read_plot_data}
+paths <- stage_paths("TopGO")
+plot_folder <- file.path(output_root, "TopGO_plots")
+list2env(readRDS(file.path(paths$data, "TopGO_plot_data.rds")),
+         envir = environment())
+plot_groups <- c("R", "U", "RU", "CT")
+plot_group_folders <- setNames(file.path(plot_folder, plot_groups), plot_groups)
+invisible(lapply(plot_group_folders, dir.create, recursive = TRUE, showWarnings = FALSE))
+set.seed(20260908)
+```
+
+# Plot helpers
+
+
+
+```{r plot_helpers}
+panel_theme <- theme(plot.background = element_rect(fill = "white", color = NA),
+                     text = element_text(size = 16),
+  panel.background = element_rect(fill = "white", color = NA),
+  legend.background = element_rect(fill = "white", color = NA),
+  plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+  plot.title.position = "plot", plot.margin = margin(12, 30, 12, 12))
+
+empty_panel <- function(title, reason) {
+  ggplot() + theme_void() + labs(title = title, subtitle = reason) + panel_theme
+}
+
+# Match the native KEGG dotplot palette, automatic limits and legend direction.
+# KEGG dots map p.adjust to fill; GO dots and enrichment maps use colour.
+p_adjust_color_scale <- function() {
+  enrichplot::set_enrichplot_color(type = "color", name = "P.adj")
+}
+
+make_dot_panel <- function(x, title) {
+  if (nrow(x@result) == 0L) return(empty_panel(title, "No significant terms"))
+  if (inherits(x, "gseaResult")) {
+    return(enrichplot::dotplot(x, showCategory = show_category, x = "NES", color = "p.adj") +
+      labs(title = title) + theme_classic(base_size = 18) + panel_theme)
+  }
+  data <- head(x@result[order(x@result$p.adjust, -abs(x@result$KSstatistic)), ], show_category)
+  data <- data[order(data$KSstatistic), ]
+  data$Term <- factor(data$ID, levels = unique(data$ID))
+  term_labels <- setNames(vapply(data$Description, function(label) {
+    paste(strwrap(label, width = 30), collapse = "\n")
+  }, character(1)), data$ID)
+  ggplot(data, aes(x = KSstatistic, y = Term, size = Count, color = p.adjust)) +
+    geom_point() + scale_y_discrete(labels = term_labels) +
+    p_adjust_color_scale() +
+    scale_size_continuous(name = "Measured genes", range = c(3, 8)) +
+    labs(title = title, x = "Signed KS statistic", y = NULL) +
+    theme_classic(base_size = 16) + panel_theme
+}
+
+make_cnet_panel <- function(x, title) {
+  if (nrow(x@result) == 0L) return(empty_panel(title, "No significant terms"))
+  enrichplot::cnetplot(x, showCategory = min(show_category, nrow(x@result)),
+                      node_label = "category", layout = "kk") +
+    labs(title = title) + panel_theme
+}
+
+make_emap_panel <- function(x, title, layout) {
+  if (nrow(x@result) < 2L) return(empty_panel(title, "At least two significant terms are required"))
+  # Similarities were computed in 7.1; this step only draws the stored result.
+  p <- enrichplot::emapplot(x, showCategory = min(show_category, nrow(x@result)),
+    node_label = "category", layout = layout, min_edge = minimum_term_similarity)
+  # A finite square plotting range also handles collinear/disconnected terms.
+  # This prevents zero-dimension viewport errors without changing graph edges.
+  p$data$label <- vapply(p$data$label, function(label) {
+    paste(strwrap(label, width = 28), collapse = "\n")
+  }, character(1))
+  xr <- range(p$data$x)
+  yr <- range(p$data$y)
+  span <- max(diff(xr), diff(yr), 1)
+  shown_sim <- x@termsim[p$data$name, p$data$name, drop = FALSE]
+  if (!any(shown_sim[upper.tri(shown_sim)] >= minimum_term_similarity, na.rm = TRUE) &&
+      diff(yr) < span * 1e-6) {
+    # Separate labels when disconnected terms otherwise lie on one horizontal line.
+    p$data$y <- mean(yr) + seq(-0.25, 0.25, length.out = nrow(p$data)) * span
+  }
+  p + p_adjust_color_scale() + coord_fixed(xlim = mean(xr) + c(-0.65, 0.65) * span,
+                  ylim = mean(yr) + c(-0.65, 0.65) * span, clip = "off") +
+    labs(title = title) + panel_theme
+}
+```
+
+# Draw all groups
+
+
+
+```{r draw_plots}
+database_titles <- c(GO_BP = "GO Biological Process", GO_MF = "GO Molecular Function",
+                     GO_CC = "GO Cellular Component", KEGG = "KEGG Pathways")
+for (group in plot_groups) {
+  for (database in names(plot_inputs)) {
+    x <- plot_inputs[[database]][[group]]
+    prefix <- paste(group, database_titles[[database]])
+    panels <- list(
+      dotplot = make_dot_panel(x, paste(prefix, "Dot Plot")),
+      cnet = make_cnet_panel(x, paste(prefix, "Gene-Term Network")),
+      emap = make_emap_panel(x, paste(prefix, "Enrichment Map"),
+                             layout = if (database == "KEGG") "with_fr" else "kk")
+    )
+    for (kind in names(panels)) {
+      save_plot(panels[[kind]], paste(database, group, kind, sep = "_"),
+                7, 5.5, dpi=1200, folder = plot_group_folders[[group]])
+    }
+  }
+}
+```
+
+```{r save_session}
+save_session(plot_folder)
+```

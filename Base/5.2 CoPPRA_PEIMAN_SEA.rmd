@@ -1,0 +1,175 @@
+---
+title: "5.2 CoPPRA PEIMAN2 SEA"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 3.1. Test PEIMAN2 human PTM annotations for the existing R, U and RU significant protein sets. Exclude categories with no significant protein hit before BH adjustment within each contrast. Report enrichment with BH-adjusted P < 0.05 and fold enrichment > 1.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(PEIMAN2)
+library(ggplot2)
+library(openxlsx)
+knitr::opts_chunk$set(dpi = 600, fig.retina = 1)
+```
+
+# Read limma results and set parameters
+
+```{r read_results}
+paths <- stage_paths("PEIMAN")
+table_folder <- paths$tables
+plot_folder <- paths$plots
+adjusted_p_cutoff <- 0.05
+groups <- c("R", "U", "RU")
+pep <- fread(file.path(output_root, "Limma", "tables", "all_peptide_differential_results.csv"))
+```
+
+# Define protein sets and background
+
+Accessions are matched exactly, without collapsing isoforms. The background contains all tested proteins mapped to the human PEIMAN2 database, including proteins annotated `No ptm`. `No ptm` is not tested as a category.
+
+```{r protein_sets}
+pep <- pep[is.finite(Ru_vs_Control_pvalue) & is.finite(Ul_vs_Control_pvalue) &
+             is.finite(RU_vs_Control_pvalue) & !is.na(Proteins) & nzchar(Proteins)]
+map <- pep[, .(id = trimws(unlist(strsplit(Proteins, ";", fixed = TRUE)))),
+  by = .(Sequence, Proteins, Gene_Names, Ru_sig, Ul_sig, RU_sig)]
+map <- map[nzchar(id) & !grepl("^(REV__|CON__)", id)]
+prot <- map[, .(
+  R = any(Ru_sig, na.rm = TRUE), U = any(Ul_sig, na.rm = TRUE),
+  RU = any(RU_sig, na.rm = TRUE), peptides = uniqueN(Sequence),
+  shared = any(grepl(";", Proteins, fixed = TRUE)),
+  genes = paste(sort(unique(na.omit(Gene_Names))), collapse = "; ")
+), by = id]
+db <- as.data.table(getFromNamespace("peiman_database", "PEIMAN2"))
+db <- unique(db[OS == "Homo sapiens (Human)", .(id = AC, term = trimws(PTM))])
+prot[, mapped := id %in% db$id]
+bg <- prot[mapped == TRUE, id]
+ann <- db[id %in% bg & !is.na(term) & nzchar(term) & tolower(term) != "no ptm"]
+sets <- setNames(lapply(groups, function(g) {
+  prot[get(g) == TRUE & mapped == TRUE, id]
+}), groups)
+fwrite(prot, file.path(table_folder, "protein_sets.csv"))
+```
+
+# Run enrichment and adjust P values
+
+Use the inclusive hypergeometric upper tail, P(X >= observed hits). Removing zero-hit categories changes the BH testing family, while the protein background remains unchanged.
+
+```{r enrichment}
+terms <- split(ann$id, ann$term)
+res <- rbindlist(lapply(groups, function(g) {
+  ids <- sets[[g]]
+  x <- rbindlist(lapply(names(terms), function(t) {
+    hits <- intersect(ids, terms[[t]])
+    data.table(set = g, term = t, hits = length(hits), size = length(ids),
+      bg_hits = length(terms[[t]]), bg_size = length(bg),
+      ids = paste(sort(hits), collapse = ";"))
+  }))
+  x <- x[hits > 0]
+  x[, p := phyper(hits - 1, bg_hits, bg_size - bg_hits, size, lower.tail = FALSE)]
+  x[, p_adj := p.adjust(p, method = "BH")]
+  x[, freq := hits / size]
+  x[, fold := freq / (bg_hits / bg_size)]
+  x[, sig := is.finite(p_adj) & p_adj < adjusted_p_cutoff & fold > 1]
+  x
+}))
+res <- res[order(match(set, groups), p_adj, p, term)]
+setcolorder(res, c("set", "term", "hits", "fold", "p", "p_adj", "sig", "size",
+                  "bg_hits", "bg_size", "freq", "ids"))
+sig <- res[sig == TRUE]
+counts <- rbindlist(lapply(groups, function(g) {
+  x <- res[set == g]
+  data.table(set = g, input = sum(prot[[g]]), mapped = length(sets[[g]]),
+    terms = nrow(x), enriched = nrow(sig[set == g]),
+    min_p = if (nrow(x)) min(x$p) else NA_real_,
+    min_p_adj = if (nrow(x)) min(x$p_adj) else NA_real_)
+}))
+write_tables(list(summary = counts, all_terms = res, significant_terms = sig), table_folder)
+knitr::kable(counts, digits = 4)
+```
+
+# Significant terms
+
+```{r term_tables, results='asis'}
+for (g in groups) {
+  cat("\n\n## ", g, "\n\n", sep = "")
+  print(knitr::kable(sig[set == g, .(
+    Term = term, Hits = hits, Background = bg_hits, Fold = round(fold, 3),
+    `Raw P` = format.pval(p, digits = 4, eps = 1e-300),
+    `BH-adjusted P` = format.pval(p_adj, digits = 4, eps = 1e-300)
+  )]))
+  cat("\n\n")
+  fwrite(sig[set == g], file.path(table_folder, paste0(g, "_significant_terms.csv")))
+}
+```
+
+# Lollipop plots
+
+Horizontal position shows relative frequency, point size shows protein count, and fill shows the actual BH-adjusted P value (P.adj). Each plot shows up to 12 significant terms, ordered by adjusted P and then raw P.
+
+```{r plots, fig.width=9, fig.height=7}
+plot_sea <- function(g, top = 12) {
+  x <- copy(sig[set == g][seq_len(min(.N, top))])
+  x[, term := factor(term, levels = term[order(freq, term)])]
+  ggplot(x, aes(freq, term)) +
+    geom_segment(aes(x = 0, xend = freq, yend = term), color = "grey40", linewidth = 0.8) +
+    geom_point(aes(size = hits, fill = p_adj), shape = 21) +
+    scale_fill_gradient(low = "maroon3", high = "mediumslateblue", name = "p.adj") +
+    scale_size_continuous(name = "Protein count", range = c(3, 9)) +
+    scale_x_continuous(limits = c(0, NA), expand = expansion(mult = c(0.02, 0.12))) +
+    labs(title = paste(g, "PTM enrichment"), x = "Relative frequency", y = NULL) +
+    theme_bw(base_size = 14) + theme(axis.text.y = element_text(face = "bold"),
+      panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+}
+for (g in groups) {
+  p <- plot_sea(g)
+  print(p)
+  save_plot(p, paste0(g, "_SEA"), width = 9, height = 6, dpi = 600)
+}
+overview <- function() {
+  grid::grid.newpage()
+  grid::pushViewport(grid::viewport(layout = grid::grid.layout(2, 2)))
+  for (i in seq_along(groups)) {
+    print(plot_sea(groups[i], 12), vp = grid::viewport(
+      layout.pos.row = (i - 1) %/% 2 + 1, layout.pos.col = (i - 1) %% 2 + 1))
+  }
+}
+png(file.path(plot_folder, "SEA_overview.png"), width = 5600 / 300,
+    height = 3500 / 300, units = "in", res = 600, type = "cairo")
+overview()
+dev.off()
+pdf(file.path(plot_folder, "SEA_overview.pdf"), width = 9, height = 6)
+overview()
+dev.off()
+```
+
+# Export contributing proteins and results
+
+Protein links identify annotated contributors; they do not measure modified-peptide abundance. Gene labels come from source peptide/protein groups.
+
+```{r export}
+links <- sig[, .(id = unlist(strsplit(ids, ";", fixed = TRUE))),
+  by = .(set, term, p, p_adj, fold)]
+links <- merge(links, prot, by = "id", all.x = TRUE, sort = FALSE)
+setcolorder(links, c("set", "term", "p", "p_adj", "fold", "id", setdiff(names(prot), "id")))
+hits <- links[, .(terms = uniqueN(term), min_p = min(p), min_p_adj = min(p_adj)), by = .(set, id)]
+hits <- merge(hits, prot, by = "id", all.x = TRUE, sort = FALSE)
+write_tables(list(term_protein_links = links, enriched_proteins = hits), table_folder)
+notes <- data.table(
+  item = c("Significance", "Test", "Background"),
+  value = c(
+    paste0("BH-adjusted P < ", adjusted_p_cutoff, " and fold > 1"),
+    "Inclusive one-sided hypergeometric test; BH within each contrast after excluding zero-hit categories",
+    paste(length(bg), "mapped proteins; No ptm proteins retained in denominator")
+  )
+)
+sheets <- list(Summary = counts, Significant = sig[, !"ids"], All_terms = res[, !"ids"],
+  Enriched_proteins = hits, Protein_links = links, Protein_sets = prot, Notes = notes)
+write.xlsx(sheets, file.path(paths$root, "CoPPRA_PEIMAN_SEA.xlsx"),
+  asTable = TRUE, firstRow = TRUE, colWidths = 24, overwrite = TRUE)
+save_session(paths$root)
+```

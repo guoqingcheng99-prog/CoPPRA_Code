@@ -1,0 +1,169 @@
+---
+title: "3.2 CoPPRA PTM limma plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 3.1. Volcano and protein UpSet plots use saved results and thresholds; no model is refitted.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ComplexUpset)
+```
+
+
+# Read saved limma results
+
+
+
+```{r read_limma}
+paths_SEA <- stage_paths_SEA("Limma")
+plot_folder_SEA <- paths_SEA$plots
+list2env(read_data_SEA(file.path(paths_SEA$data, "Limma_results_SEA.rds")), envir = environment())
+```
+
+# Peptide volcano plots
+
+
+
+```{r peptide_volcano, fig.width=12, fig.height=6}
+volcano_data_SEA <- dplyr::bind_rows(
+  peptide_significance_SEA %>%
+    dplyr::as_tibble() %>%
+    dplyr::transmute(
+      Sequence,
+      log2FC = Ru_log2FC,
+      p_value = Ru_vs_Control_pvalue,
+      Comparison = "Ru vs Control"
+    ),
+  peptide_significance_SEA %>%
+    dplyr::as_tibble() %>%
+    dplyr::transmute(
+      Sequence,
+      log2FC = Ul_log2FC,
+      p_value = Ul_vs_Control_pvalue,
+      Comparison = "Ul vs Control"
+    ),
+  peptide_significance_SEA %>%
+    dplyr::as_tibble() %>%
+    dplyr::transmute(
+      Sequence,
+      log2FC = RU_log2FC,
+      p_value = RU_vs_Control_pvalue,
+      Comparison = "RU vs Control"
+    )
+) %>%
+  dplyr::mutate(
+    Comparison = factor(
+      Comparison,
+      levels = c("Ru vs Control", "Ul vs Control", "RU vs Control")
+    ),
+    neg_log10_p = -log10(
+      pmax(p_value, .Machine$double.xmin)
+    ),
+    Peptide_call = dplyr::case_when(
+      p_value < pval_threshold_SEA &
+        log2FC > log2fc_threshold_SEA ~ "Higher in treatment",
+      p_value < pval_threshold_SEA &
+        log2FC < -log2fc_threshold_SEA ~ "Higher in Control",
+      TRUE ~ "Not significant"
+    )
+  )
+
+p_volcano_SEA <- ggplot(
+  volcano_data_SEA,
+  aes(log2FC, neg_log10_p, color = Peptide_call)
+) +
+  geom_point(size = 1.4, alpha = 0.75) +
+  geom_hline(
+    yintercept = -log10(pval_threshold_SEA),
+    linetype = "dashed",
+    color = "grey40"
+  ) +
+  geom_vline(
+    xintercept = c(-log2fc_threshold_SEA, log2fc_threshold_SEA),
+    linetype = "dashed",
+    color = "grey40"
+  ) +
+  facet_wrap(~Comparison, nrow = 1) +
+  scale_color_manual(
+    values = c(
+      "Not significant" = "grey75",
+      "Higher in Control" = "#1F77B4",
+      "Higher in treatment" = "#D62728"
+    ),
+    name = "Peptide call"
+  ) +
+  labs(
+    x = "log2(Fold Change)",
+    y = "-log10(P value)"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    strip.text = element_text(size = 18),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 16)
+  )
+
+print(p_volcano_SEA)
+
+save_plot_SEA(p_volcano_SEA, "peptide_volcano_significant", 18, 6)
+```
+
+# Protein intersections
+
+
+
+```{r protein_upset, fig.width=12, fig.height=6}
+if (nrow(protein_significance_SEA) == 0L) {
+  cat("No significant proteins; no UpSet intersections to draw.\n")
+} else {
+protein_upset_data_SEA <- protein_significance_SEA %>%
+  dplyr::select(ProteinID, Ru_sig, RU_sig, Ul_sig)
+
+colnames(protein_upset_data_SEA) <- c("ProteinID", "R", "RU", "U")
+
+upset_theme_SEA <- theme_minimal() +
+  theme(
+    text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    legend.position = "right"
+  )
+
+p_upset_SEA <- upset(
+  protein_upset_data_SEA,
+  c("R", "U", "RU"),
+  name = "Significant proteins",
+  encode_sets = FALSE,
+  base_annotations = list(
+    "Protein Numbers" = intersection_size(
+      text = list(size = 6)
+    ) +
+      labs(y = "Protein Numbers") +
+      upset_theme_SEA
+  ),
+  width_ratio = 0.1,
+  min_size = 1,
+  themes = upset_theme_SEA
+) +
+  ggtitle("Conjunctional targeting") +
+  theme(
+    plot.title = element_text(size = 18, face = "bold")
+  )
+
+print(p_upset_SEA)
+
+save_plot_SEA(p_upset_SEA, "significant_protein_upset", 10, 6)
+}
+```

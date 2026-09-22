@@ -1,0 +1,248 @@
+---
+title: "1.2 CoPPRA QC plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 1.1. This file reads saved QC results and creates PNG/PDF plots in `QC/plots`; it does not read evidence or repeat quantification.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+```
+
+
+# Read saved QC results
+
+
+
+```{r read_qc}
+paths <- stage_paths("QC")
+plot_folder <- paths$plots
+qc <- readRDS(file.path(paths$data, "QC_plot_data.rds"))
+list2env(qc, envir = environment())
+theme_set(theme_bw(base_size = 14) + theme(
+  plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+  axis.title = element_text(size = 16), axis.text = element_text(size = 14),
+  strip.text = element_text(size = 16, face = "bold")))
+```
+
+# Peptide intensity distributions
+
+
+
+```{r intensity_plot, fig.width=18, fig.height=7}
+int_plot <- merge(
+  pep_run[, .(
+    Raw.file,
+    Log2_intensity = log2(Peptide_intensity)
+  )],
+  runs[, .(Raw.file, Condition, Bio_rep)],
+  by = "Raw.file"
+)
+
+p_intensity <- ggplot(
+  int_plot,
+  aes(
+    x = factor(Bio_rep, levels = 1:3),
+    y = Log2_intensity,
+    fill = Condition
+  )
+) +
+  geom_boxplot(width = 0.72, outlier.size = 0.2) +
+  facet_wrap(~Condition, nrow = 1) +
+  scale_fill_manual(values = condition_colors, drop = FALSE) +
+  labs(
+    title = "Peptide Intensity Distributions",
+    x = "Biological replicate",
+    y = "log2 peptide intensity"
+  ) +
+  theme(legend.position = "none")
+
+print(p_intensity)
+save_plot(p_intensity, "QC_peptide_intensity_boxplot", 10, 4)
+```
+
+# Coverage
+
+
+
+```{r coverage_plot, fig.width=18, fig.height=9}
+cov_plot <- rbindlist(list(
+  run_cov[, .(
+    Condition,
+    Bio_rep,
+    Metric = "Peptides",
+    Coverage = Unique_peptides
+  )],
+  run_cov[, .(
+    Condition,
+    Bio_rep,
+    Metric = "Protein groups",
+    Coverage = Leading_protein_groups
+  )]
+))
+cov_plot[, Metric := factor(
+  Metric,
+  levels = c("Peptides", "Protein groups")
+)]
+
+p_coverage <- ggplot(
+  cov_plot,
+  aes(
+    x = factor(Bio_rep, levels = 1:3),
+    y = Coverage,
+    fill = Condition
+  )
+) +
+  geom_boxplot(width = 0.72) +
+  facet_grid(Metric ~ Condition, scales = "free_y") +
+  scale_fill_manual(values = condition_colors, drop = FALSE) +
+  labs(
+    title = "Peptide and Protein Coverage",
+    x = "Biological replicate",
+    y = "Distinct identifications"
+  ) +
+  theme(legend.position = "none")
+
+print(p_coverage)
+save_plot(p_coverage, "QC_coverage_boxplot", 10, 5)
+```
+
+# Missingness
+
+
+
+```{r missingness_plot, fig.width=18, fig.height=7}
+p_missingness <- ggplot(
+  run_cov,
+  aes(
+    x = factor(Raw.file, levels = raw_order),
+    y = 100 * Peptide_missingness,
+    fill = Condition
+  )
+) +
+  geom_col() +
+  scale_fill_manual(values = condition_colors, drop = FALSE) +
+  labs(
+    title = "Peptide-level Missingness by Technical Run",
+    x = "Technical run",
+    y = "Missing peptide values (%)",
+    fill = "Condition"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      size = 12,
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5
+    )
+  )
+
+print(p_missingness)
+save_plot(p_missingness, "QC_peptide_missingness_by_raw_file", 10, 4)
+```
+
+# Technical correlations
+
+
+
+```{r technical_heatmap, fig.width=20, fig.height=18}
+run_annotation <- data.frame(
+  Sample = runs$Experiment,
+  Condition = as.character(runs$Condition),
+  Tech_run = factor(runs$Tech_rep),
+  row.names = runs$Raw.file
+)
+
+make_heatmap <- function(
+    matrix, order, annotation, title, angle, show_names = TRUE) {
+  heatmap <- pheatmap(
+    matrix[order, order],
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    annotation_row = annotation[order, , drop = FALSE],
+    annotation_col = annotation[order, , drop = FALSE],
+    annotation_colors = list(Condition = condition_colors),
+    border_color = NA,
+    fontsize = 18,
+    fontsize_row = 16,
+    fontsize_col = 16,
+    show_rownames = show_names,
+    show_colnames = show_names,
+    angle_col = angle,
+    main = title,
+    silent = TRUE
+  )
+
+  title_row <- which(heatmap$gtable$layout$name == "main")
+  heatmap$gtable$grobs[[title_row]]$gp$fontsize <- 20
+
+  # Move legends downward by 10% of the plot height
+  legend_rows <- which(
+    heatmap$gtable$layout$name %in% c("legend", "annotation_legend")
+  )
+
+  for (i in legend_rows) {
+    heatmap$gtable$grobs[[i]] <- grobTree(
+      heatmap$gtable$grobs[[i]],
+      vp = viewport(y = unit(0.4, "npc"))
+    )
+  }
+
+  heatmap
+}
+
+run_heatmap <- make_heatmap(
+  run_cor,
+  raw_order,
+  run_annotation,
+  "Pearson Correlation among Technical Runs",
+  "90",
+  FALSE
+)
+
+grid.newpage()
+grid.draw(run_heatmap$gtable)
+
+save_plot(
+  run_heatmap$gtable,
+  "QC_Pearson_correlation_technical_runs",
+  9,
+  8
+)
+```
+
+# Biological correlations
+
+
+
+```{r sample_heatmap, fig.width=12, fig.height=11}
+sample_annotation <- data.frame(
+  Condition = as.character(samples$Condition),
+  Biological_replicate = factor(samples$Bio_rep),
+  row.names = samples$Experiment
+)
+
+sample_heatmap <- make_heatmap(
+  sample_cor,
+  sample_order,
+  sample_annotation,
+  "Pearson Correlation among Samples",
+  "45"
+)
+
+grid.newpage()
+grid.draw(sample_heatmap$gtable)
+save_plot(
+  sample_heatmap$gtable,
+  "QC_Pearson_correlation_samples",
+  8,
+  7
+)
+```

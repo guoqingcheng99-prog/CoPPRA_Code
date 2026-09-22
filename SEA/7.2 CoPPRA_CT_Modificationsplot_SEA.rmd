@@ -1,0 +1,52 @@
+---
+title: "7.2 PTM CT modification plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+The CT Venn remains in section 5. Here show modification support within its PTM CT regions. Modification categories can overlap; "Other modified evidence" excludes Phospho (STY) so the stacked support groups are disjoint.
+
+```{r setup}
+source("CoPPRA_config_SEA.R",local=TRUE)
+source("CoPPRA_validation_SEA.R",local=TRUE)
+library(ggplot2)
+validation_theme_SEA()
+paths_SEA <- stage_paths_SEA("CT_modifications")
+plot_folder_SEA <- paths_SEA$plots
+x <- readRDS(file.path(paths_SEA$data,"CT_modifications_SEA.rds"))
+
+clean_plot_text_SEA <- function(p) {
+  p +
+    labs(subtitle = NULL, caption = NULL, tag = NULL) +
+    theme(
+      plot.subtitle = element_blank(),
+      plot.caption = element_blank(),
+      plot.tag = element_blank()
+    )
+}
+```
+
+# Plot CT modification support
+
+```{r ct_support,fig.width=8.5,fig.height=6}
+z <- copy(x$annotation)
+z[,Support:=fifelse(Has_Phospho_STY,"Phospho (STY)",fifelse(Has_modified_evidence,"Other modified evidence","Unmodified evidence only"))]
+a <- z[,.(Proteins=.N),by=.(CT_region,Support)]
+p <- ggplot(a,aes(CT_region,Proteins,fill=Support))+geom_col(width=.65)+
+  scale_fill_manual(values=c("Phospho (STY)"="#D55E00","Other modified evidence"="#E6AB02","Unmodified evidence only"="#BDBDBD"))+
+  scale_x_discrete(labels=display_label_SEA)+
+  labs(title="Modification support for PTM CT proteins",x=NULL,y="CT protein accessions",fill=NULL)+
+  theme(legend.position="bottom")
+p <- clean_plot_text_SEA(p)
+print(p);save_plot_SEA(p,"CT_modification_support",8.5,5.5,dpi=600)
+p <- ggplot(x$categories,aes(reorder(Category,CT_proteins),CT_proteins))+geom_col(fill="#E88931")+
+  coord_flip()+
+  scale_y_continuous(expand=expansion(mult=c(0,.05)))+
+  labs(title="Modification categories in PTM CT",x=NULL,y="CT protein accessions")
+p <- clean_plot_text_SEA(p)
+print(p);save_plot_SEA(p,"CT_modification_categories",8.5,5.5,dpi=600)
+save_session_SEA(paths_SEA$plots)
+```

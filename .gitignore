@@ -1,0 +1,20 @@
+# Local OS and R session files
+.DS_Store
+.RData
+.Rhistory
+.Rapp.history
+.Rproj.user/
+.Renviron
+.env
+.env.*
+
+# Generated analysis outputs and mass-spectrometry inputs
+Results/
+results/
+*_cache/
+*_files/
+*.raw
+*.mzML
+*.mzXML
+evidence*.txt
+proteinGroups*.txt

@@ -1,0 +1,171 @@
+---
+title: "7.1 Base versus SEA detection and modification analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run before the paired 7.1 plotting file. Compare the current Base and SEA v2 inputs. Peptides are unique unmodified `Sequence`; modified forms are unique `Modified sequence` across charges and runs. Protein accessions are exact IDs (isoforms retained); protein groups are exact sorted membership sets, never numeric run-local IDs. A shared peptide does not independently identify every group member.
+
+The primary comparison applies the **same identification QC** to both inputs: target evidence with positive finite intensity and Q-value <= 0.01, matched protein groups passing Q-value <= 0.01 and decoy/contaminant/site-only exclusions, verified unique-plus-razor assignment, and consistent group assignment per sequence. It has no two-peptide or recurrence requirement. Thus it describes identified, quantified evidence under shared rules. The second comparison uses each existing pipeline's saved analysis input; Base and SEA have different upstream QC. All-sample and non-carrier counts are exported separately.
+
+Modification categories overlap: a form bearing Phospho (STY) and Oxidation (M) appears in both category totals. Combination totals are disjoint by the exact `Modifications` label. The added SEA category is Phospho (STY); oxidation and protein N-terminal acetylation are baseline categories. Evidence annotations do not by themselves establish modification-site localization or a modification-specific treatment effect. The confidence audit reports Q-values, PEP and availability of phosphorylation localization probabilities without imposing a new PEP cutoff.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local=TRUE)
+source("CoPPRA_QC_filters.R", local=TRUE)
+source("CoPPRA_validation_SEA.R", local=TRUE)
+paths_SEA <- stage_paths_SEA("Search_validation")
+base_dir <- path.expand(Sys.getenv("COPPRA_PROJECT_DIR",unset=file.path(dirname(project_dir_SEA),"Base")))
+base_output <- path.expand(Sys.getenv("COPPRA_BASE_OUTPUT",unset=file.path(base_dir,"Results")))
+source(file.path(base_dir,"Code","CoPPRA_validate_inputs.R"),local=TRUE)
+files <- list(Base=c(evidence=file.path(base_dir,"evidence_new.txt"),
+  proteins=path.expand(Sys.getenv("COPPRA_BASE_PROTEIN_GROUPS",unset=file.path(base_dir,"proteinGroups_base.txt"))),
+  quant=file.path(base_output,"QC/data/quantification.rds")),
+  SEA=c(evidence=evidence_file_SEA,proteins=protein_groups_file_SEA,
+  quant=file.path(output_root_SEA,"QC/data/quantification_SEA.rds")))
+stopifnot(all(file.exists(unlist(files))))
+quant <- lapply(files,function(f) readRDS(f[["quant"]]))
+stopifnot(setequal(quant$Base$runs$Raw.file,quant$SEA$runs$Raw.file))
+a <- as.data.table(quant$Base$runs)[,.(Raw.file,Experiment)]
+b <- as.data.table(quant$SEA$runs)[,.(Raw.file,Experiment)]
+stopifnot(nrow(merge(a,b,by=c("Raw.file","Experiment")))==45L)
+common <- list(); comparisons <- list(); mod_tables <- list(); combinations <- list()
+checks <- list(); input_manifest <- list(); localization_audit <- list()
+```
+
+# Analysis: paired inputs, common QC, and saved-input reconciliation
+
+```{r evidence_validation}
+for (dataset in names(files)) {
+  f <- files[[dataset]]
+  message("Reading and validating ",dataset)
+  cols <- c("Raw file","Experiment","Sequence","Decoy","Potential contaminant","Proteins",
+    "Leading proteins","Leading razor proteins","Protein group IDs","Peptide ID","Gene Names",
+    "Protein Names","Intensity","Q-value","Modifications","Modified sequence","Charge","id","PEP")
+  if(dataset=="SEA") cols <- c(cols,"Phospho (STY) Probabilities","DIA evidence type")
+  ev <- fread(f[["evidence"]],na.strings=c("","NA"),select=cols)
+  setnames(ev,make.names(names(ev)))
+  stopifnot(!anyNA(ev$id),!anyDuplicated(ev$id),!anyNA(ev$Modifications),!anyNA(ev$Modified.sequence))
+  validate_coppra_input_pair(ev,f[["proteins"]])
+  if(dataset=="SEA") {
+    ph <- ev[grepl("Phospho (STY)",Modifications,fixed=TRUE)]
+    localization_audit[[dataset]] <- ph[,.(Evidence_rows=.N,Minimum_Q_value=min(Q.value),
+      Maximum_Q_value=max(Q.value),Median_PEP=median(PEP),Rows_with_PEP_le_001=sum(PEP<=.01),
+      Rows_with_localization_probability=sum(!is.na(Phospho..STY..Probabilities) &
+        nzchar(as.character(Phospho..STY..Probabilities)))),by=DIA.evidence.type]
+  }
+  q <- quant[[dataset]]
+  stopifnot(normalizePath(q$input_files$evidence)==normalizePath(f[["evidence"]]),
+    normalizePath(q$input_files$protein_groups)==normalizePath(f[["proteins"]]))
+  fit <- coppra_qc(ev,q$sample_map,protein_groups_file=f[["proteins"]],
+    audit_dir=file.path(paths_SEA$root,"input_audit",dataset),
+    filter_peptide_recurrence=FALSE,filter_protein_peptide_count=FALSE,min_raw_file_fraction=0)
+  stopifnot(isTRUE(fit$complete))
+  common[[dataset]] <- fit$evidence
+  # The SEA evidence reconstruction must match the retained row manifest exactly.
+  if (dataset=="SEA") {
+    z <- copy(fit$evidence)
+    support <- unique(z[,.(Sequence,Proteins)])[,.(ProteinID=split_ids_validation(Proteins)),by=Sequence][
+      ,.(N=uniqueN(Sequence)),by=ProteinID]
+    keep_ids <- support[N>=q$method$minimum_distinct_peptides_per_accession,ProteinID]
+    mapping <- unique(z[,.(Proteins)])
+    mapping[, NewProteins := vapply(Proteins,function(x) paste(intersect(split_ids_validation(x),keep_ids),collapse=";"),character(1))]
+    z[mapping,on="Proteins",Proteins:=i.NewProteins]
+    z <- z[nzchar(Proteins)]
+    detection <- z[,.(N=uniqueN(Raw.file)),by=Sequence]
+    z <- z[Sequence %in% detection[N>=q$method$minimum_raw_files_detected,Sequence]]
+    retained_file <- file.path(output_root_SEA,"QC/tables/QC_retained_evidence_SEA.csv")
+    retained <- fread(retained_file,select=c("QC_row","Sequence","Raw.file","Experiment","QC_group","Q.value"))
+    stopifnot(!anyDuplicated(z$QC_row),setequal(z$QC_row,retained$QC_row),nrow(z)==q$n_evidence)
+    setorder(z,QC_row);setorder(retained,QC_row)
+    stopifnot(identical(z$Sequence,retained$Sequence),identical(z$Raw.file,retained$Raw.file),
+      identical(z$Experiment,retained$Experiment),isTRUE(all.equal(z$Q.value,retained$Q.value,tolerance=1e-12)),
+      all(as.character(z$QC_group)==as.character(retained$QC_group)),
+      setequal(z$Sequence,rownames(q$biological_log2)))
+    ann <- z[,.(Proteins=canonical_group(paste(Proteins,collapse=";"))),by=Sequence]
+    old <- as.data.table(q$peptide_annotation)[,.(Sequence,Old=canonical_group(Proteins))]
+    stopifnot(nrow(merge(ann,old,by="Sequence")[Proteins!=Old])==0L)
+    sea_retained <- z
+    input_manifest[["retained"]] <- data.table(Dataset="SEA",Role="QC retained evidence",File=retained_file)
+  }
+  for (scope in c("All samples","Non-carrier")) {
+    e <- if(scope=="All samples") fit$evidence else fit$evidence[QC_condition!="Carrier"]
+    mod_tables[[paste(dataset,scope)]] <- mod_summary_validation(e,dataset,scope)
+    combinations[[paste(dataset,scope)]] <- e[,.(Evidence_rows=.N,Sequences=uniqueN(Sequence),
+      Modified_forms=uniqueN(Modified.sequence)),by=Modifications][,`:=`(Dataset=dataset,Scope=scope)]
+  }
+  checks[[dataset]] <- data.table(Dataset=dataset,Input_rows=nrow(ev),Common_QC_rows=nrow(fit$evidence),
+    Common_QC_sequences=uniqueN(fit$evidence$Sequence),Saved_analysis_sequences=nrow(q$biological_log2),
+    Paired_input_check="PASS",Raw_files=uniqueN(ev$Raw.file))
+  input_manifest[[dataset]] <- data.table(Dataset=dataset,Role=names(f),File=unname(f))
+  rm(ev,fit);gc()
+}
+mod_tables[["SEA retained"]] <- mod_summary_validation(sea_retained,"SEA","Retained analysis evidence")
+mod_summary <- rbindlist(mod_tables)
+combination_summary <- rbindlist(combinations)
+```
+
+# Analysis: set membership and modification support
+
+```{r compare_sets}
+get_sets <- function(e) list(Peptide_sequences=sort(unique(e$Sequence)),
+  Modified_forms=sort(unique(e$Modified.sequence)),Protein_accessions=split_ids_validation(unique(e$Proteins)),
+  Protein_groups=sort(unique(canonical_group(e$Proteins))))
+sets <- list(Common_QC_All=lapply(common,get_sets),
+  Common_QC_Noncarrier=lapply(common,function(e) get_sets(e[QC_condition!="Carrier"])),
+  Existing_analysis=lapply(quant,function(q) list(Peptide_sequences=sort(rownames(q$biological_log2)),
+    Protein_accessions=split_ids_validation(q$peptide_annotation$Proteins))))
+counts <- list(); memberships <- list()
+for (scope in names(sets)) for (entity in names(sets[[scope]]$Base)) {
+  x <- sets[[scope]]$Base[[entity]]; y <- sets[[scope]]$SEA[[entity]]
+  m <- data.table(ID=sort(union(x,y)))
+  m[,`:=`(Base=ID%in%x,SEA=ID%in%y)]
+  m[,Region:=fifelse(Base&SEA,"Shared",fifelse(Base,"Base only","SEA only"))]
+  counts[[paste(scope,entity)]] <- data.table(Scope=scope,Entity=entity,Base=length(x),SEA=length(y),
+    Shared=length(intersect(x,y)),Base_only=length(setdiff(x,y)),SEA_only=length(setdiff(y,x)),Union=nrow(m))
+  memberships[[paste(scope,entity,sep="_")]] <- m
+}
+counts <- rbindlist(counts)
+stopifnot(all(counts$Base==counts$Shared+counts$Base_only),all(counts$SEA==counts$Shared+counts$SEA_only))
+# Save modification forms with group assignment, condition and traceable source rows.
+forms <- sea_retained[,.(Evidence_rows=.N,Raw_files=uniqueN(Raw.file),Experiments=uniqueN(Experiment),
+  Min_Q_value=min(Q.value),Median_PEP=median(PEP,na.rm=TRUE),
+  Evidence_IDs=paste(id,collapse=";")),
+  by=.(Sequence,Modified.sequence,Modifications,Proteins,QC_group,QC_condition)]
+forms[,`:=`(Is_modified=Modifications!="Unmodified",Has_Phospho_STY=grepl("Phospho (STY)",Modifications,fixed=TRUE),
+  Group_members=lengths(strsplit(Proteins,";",fixed=TRUE)))]
+forms[,Base_detected_sequence:=Sequence%in%common$Base$Sequence]
+# Separate the added modification from baseline modifications and novel sequences.
+phospho_summary <- rbindlist(lapply(c("Common QC all", "Common QC non-carrier", "Retained SEA analysis"), function(scope) {
+  e <- switch(scope, "Common QC all"=common$SEA,
+    "Common QC non-carrier"=common$SEA[QC_condition!="Carrier"], "Retained SEA analysis"=sea_retained)
+  e <- e[grepl("Phospho (STY)",Modifications,fixed=TRUE)]
+  base_sequences <- if(scope=="Common QC non-carrier") common$Base[QC_condition!="Carrier",Sequence] else common$Base$Sequence
+  data.table(Scope=scope,Evidence_rows=nrow(e),Sequences=uniqueN(e$Sequence),
+    Modified_forms=uniqueN(e$Modified.sequence),Protein_accessions=length(split_ids_validation(e$Proteins)),
+    Protein_groups=uniqueN(canonical_group(e$Proteins)),
+    Sequences_also_detected_in_Base=length(intersect(unique(e$Sequence),base_sequences)),
+    Sequences_absent_from_Base=length(setdiff(unique(e$Sequence),base_sequences)))
+}))
+write_tables_SEA(c(list(Phospho_STY_confidence_audit=rbindlist(localization_audit),added_Phospho_STY_summary=phospho_summary,comparison_counts=counts,modification_categories=mod_summary,
+  modification_combinations=combination_summary,input_validation=rbindlist(checks),
+  retained_modification_evidence=forms),memberships),paths_SEA$tables)
+code_files <- c(file.path(project_dir_SEA,c("CoPPRA_config_SEA.R","CoPPRA_QC_filters.R",
+  "CoPPRA_validation_SEA.R","7.1 CoPPRA_Search_Validation_SEA.rmd")),
+  file.path(base_dir,"Code","CoPPRA_config.R"))
+input_manifest[["code"]] <- data.table(Dataset="Code",Role="Analysis source",File=code_files)
+manifest <- rbindlist(input_manifest)
+manifest[,`:=`(Bytes=file.info(File)$size,MD5=unname(tools::md5sum(File)))]
+fwrite(manifest,file.path(paths_SEA$tables,"input_manifest_SEA.csv"))
+saveRDS(list(sets=sets,counts=counts,modification_categories=mod_summary,
+  modification_combinations=combination_summary,added_Phospho_STY_summary=phospho_summary,confidence_audit=rbindlist(localization_audit),forms=forms,manifest=manifest),
+  file.path(paths_SEA$data,"Search_validation_SEA.rds"))
+knitr::kable(counts)
+knitr::kable(mod_summary)
+knitr::kable(phospho_summary)
+knitr::kable(rbindlist(localization_audit))
+save_session_SEA(paths_SEA$root)
+```

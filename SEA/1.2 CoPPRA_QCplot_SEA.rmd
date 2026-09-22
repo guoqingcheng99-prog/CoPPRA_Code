@@ -1,0 +1,281 @@
+---
+title: "1.2 CoPPRA PTM QC plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 1.1. This file reads saved QC results and creates PNG/PDF plots in `QC/plots`; it does not read evidence or repeat quantification.
+
+```{r setup}
+source("CoPPRA_config_SEA.R", local = TRUE)
+library(ggplot2)
+library(pheatmap)
+library(grid)
+```
+
+
+# Read saved QC results
+
+
+
+```{r read_qc}
+paths_SEA <- stage_paths_SEA("QC")
+plot_folder_SEA <- paths_SEA$plots
+qc_SEA <- readRDS(file.path(paths_SEA$data, "QC_plot_data_SEA.rds"))
+list2env(setNames(qc_SEA, paste0(names(qc_SEA), "_SEA")), envir = environment())
+theme_set(theme_bw(base_size = 14) + theme(
+  plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+  axis.title = element_text(size = 16), axis.text = element_text(size = 14),
+  strip.text = element_text(size = 16, face = "bold")))
+```
+
+# Peptide intensity distributions
+
+
+
+```{r intensity_plot, fig.width=18, fig.height=7}
+int_plot_SEA <- merge(
+  pep_run_SEA[, .(
+    Raw.file,
+    Log2_intensity = log2(Peptide_intensity)
+  )],
+  runs_SEA[, .(Raw.file, Condition, Bio_rep)],
+  by = "Raw.file"
+)
+
+p_intensity_SEA <- ggplot(
+  int_plot_SEA,
+  aes(
+    x = factor(Bio_rep, levels = 1:3),
+    y = Log2_intensity,
+    fill = Condition
+  )
+) +
+  geom_boxplot(width = 0.72, outlier.size = 0.2) +
+  facet_wrap(~Condition, nrow = 1) +
+  scale_fill_manual(values = condition_colors_SEA, drop = FALSE) +
+  labs(
+    title = "Peptide Intensity Distributions",
+    x = "Biological replicate",
+    y = "log2 peptide intensity"
+  ) +
+  theme(legend.position = "none")
+
+print(p_intensity_SEA)
+save_plot_SEA(p_intensity_SEA, "QC_peptide_intensity_boxplot", 10, 4)
+```
+
+# Coverage
+
+
+
+```{r coverage_plot, fig.width=18, fig.height=9}
+cov_plot_SEA <- rbindlist(list(
+  run_cov_SEA[, .(
+    Condition,
+    Bio_rep,
+    Metric = "Peptides",
+    Coverage = Unique_peptides
+  )],
+  run_cov_SEA[, .(
+    Condition,
+    Bio_rep,
+    Metric = "Protein groups",
+    Coverage = Leading_protein_groups
+  )]
+))
+cov_plot_SEA[, Metric := factor(
+  Metric,
+  levels = c("Peptides", "Protein groups")
+)]
+
+p_coverage_SEA <- ggplot(
+  cov_plot_SEA,
+  aes(
+    x = factor(Bio_rep, levels = 1:3),
+    y = Coverage,
+    fill = Condition
+  )
+) +
+  geom_boxplot(width = 0.72) +
+  facet_grid(Metric ~ Condition, scales = "free_y") +
+  scale_fill_manual(values = condition_colors_SEA, drop = FALSE) +
+  labs(
+    title = "Peptide and Protein Coverage",
+    x = "Biological replicate",
+    y = "Distinct identifications"
+  ) +
+  theme(legend.position = "none")
+
+print(p_coverage_SEA)
+save_plot_SEA(p_coverage_SEA, "QC_coverage_boxplot", 10, 5)
+```
+
+# Missingness
+
+
+
+```{r missingness_plot, fig.width=18, fig.height=7}
+p_missingness_SEA <- ggplot(
+  run_cov_SEA,
+  aes(
+    x = factor(Raw.file, levels = raw_order_SEA),
+    y = 100 * Peptide_missingness,
+    fill = Condition
+  )
+) +
+  geom_col() +
+  scale_fill_manual(values = condition_colors_SEA, drop = FALSE) +
+  labs(
+    title = "Peptide-level Missingness by Technical Run",
+    x = "Technical run",
+    y = "Missing peptide values (%)",
+    fill = "Condition"
+  ) +
+  theme(
+    axis.text.x = element_text(
+      size = 12,
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5
+    )
+  )
+
+print(p_missingness_SEA)
+save_plot_SEA(p_missingness_SEA, "QC_peptide_missingness_by_raw_file", 10, 4)
+```
+
+# Technical correlations
+
+
+
+```{r technical_heatmap, fig.width=20, fig.height=18}
+run_annotation_SEA <- data.frame(
+  Sample = runs_SEA$Experiment,
+  Condition = as.character(runs_SEA$Condition),
+  Tech_run = factor(runs_SEA$Tech_rep),
+  row.names = runs_SEA$Raw.file
+)
+
+make_heatmap_SEA <- function(
+    matrix, order, annotation, title, angle, show_names = TRUE) {
+  heatmap <- pheatmap(
+    matrix[order, order],
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    annotation_row = annotation[order, , drop = FALSE],
+    annotation_col = annotation[order, , drop = FALSE],
+    annotation_colors = list(Condition = condition_colors_SEA),
+    # Annotation names are already shown in the legend; avoid duplicate labels
+    # colliding with the 18-point legend and 16-point sample names.
+    annotation_names_row = FALSE,
+    annotation_names_col = FALSE,
+    border_color = NA,
+    fontsize = 18,
+    fontsize_row = 16,
+    fontsize_col = 16,
+    show_rownames = show_names,
+    show_colnames = show_names,
+    angle_col = angle,
+    main = title,
+    silent = TRUE
+  )
+  title_row <- which(heatmap$gtable$layout$name == "main")
+  heatmap$gtable$grobs[[title_row]]$gp$fontsize <- 20
+  heatmap$gtable$layout[title_row, c("l", "r")] <- list(1L, ncol(heatmap$gtable))
+  # Repeating the same annotations on both axes can offset pheatmap's legend
+  # below the canvas. Align its first visible heading with the top instead.
+  legend_row <- which(heatmap$gtable$layout$name == "annotation_legend")
+  if (length(legend_row)) {
+    legend <- heatmap$gtable$grobs[[legend_row]]
+    offset <- grid::unit(1, "npc") - legend$children[[1]]$y
+    for (i in seq_along(legend$children)) {
+      legend$children[[i]]$y <- legend$children[[i]]$y + offset
+    }
+    heatmap$gtable$grobs[[legend_row]] <- legend
+  }
+  heatmap
+}
+
+run_heatmap_SEA <- make_heatmap_SEA(
+  run_cor_SEA,
+  raw_order_SEA,
+  run_annotation_SEA,
+  "Pearson Correlation among Technical Runs",
+  "90",
+  FALSE
+)
+
+grid.newpage()
+grid.draw(run_heatmap_SEA$gtable)
+save_plot_SEA(
+  run_heatmap_SEA$gtable,
+  "QC_Pearson_correlation_technical_runs",
+  12,
+  11
+)
+```
+
+# Biological correlations
+
+
+
+```{r sample_heatmap, fig.width=12, fig.height=11}
+sample_annotation_SEA <- data.frame(
+  Condition = as.character(samples_SEA$Condition),
+  Biological_replicate = factor(samples_SEA$Bio_rep),
+  row.names = samples_SEA$Experiment
+)
+
+sample_heatmap_SEA <- make_heatmap_SEA(
+  sample_cor_SEA,
+  sample_order_SEA,
+  sample_annotation_SEA,
+  "Pearson Correlation among Samples",
+  "45"
+)
+
+grid.newpage()
+grid.draw(sample_heatmap_SEA$gtable)
+save_plot_SEA(
+  sample_heatmap_SEA$gtable,
+  "QC_Pearson_correlation_samples",
+  8,
+  7
+)
+```
+
+
+# Coverage before and after QC
+
+Protein counts are verified MaxQuant protein groups; peptides are distinct unmodified sequences. Counts include all 45 raw files, with a separate view excluding carriers.
+
+```{r coverage_before_after, fig.width=12, fig.height=7}
+coverage_comparison_SEA <- as.data.table(qc_SEA$qc_coverage_before_after)
+coverage_comparison_SEA <- coverage_comparison_SEA[Stage %in% c("Before_QC", "After_complete_QC")]
+coverage_long_SEA <- melt(coverage_comparison_SEA,
+  id.vars = c("Stage", "Scope"),
+  measure.vars = c("Evidence_rows", "Peptide_sequences", "Verified_assigned_groups"),
+  variable.name = "Metric", value.name = "Count")
+coverage_long_SEA[, Stage := factor(Stage,
+  levels = c("Before_QC", "After_complete_QC"), labels = c("Before QC", "After QC"))]
+coverage_long_SEA[, Metric := factor(Metric,
+  levels = c("Evidence_rows", "Peptide_sequences", "Verified_assigned_groups"),
+  labels = c("Evidence rows", "Peptide sequences", "Protein groups"))]
+coverage_long_SEA[, Scope := factor(Scope,
+  levels = c("All_samples", "Non_carrier"), labels = c("All samples", "Non-carrier samples"))]
+p_before_after_SEA <- ggplot(coverage_long_SEA, aes(Stage, Count, fill = Stage)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = format(Count, big.mark = ",", scientific = FALSE, trim = TRUE)),
+    vjust = -0.35, size = 3.5) +
+  facet_wrap(~ Scope + Metric, scales = "free_y", ncol = 3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.16))) +
+  scale_fill_manual(values = c("Before QC" = "#8A99A6", "After QC" = "#287C8E")) +
+  labs(title = "Coverage before and after QC", x = NULL, y = "Count") +
+  theme(legend.position = "none")
+print(p_before_after_SEA)
+save_plot_SEA(p_before_after_SEA, "QC_coverage_before_after", 12, 7)
+```

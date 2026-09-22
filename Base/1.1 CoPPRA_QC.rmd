@@ -1,0 +1,401 @@
+---
+title: "1.1 CoPPRA QC, quantification and coverage"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run this file first. Modified signals are included, and all modification forms are pooled by `Sequence`. Modification-specific quantification is not possible from the resulting peptide matrix. This matches the modification handling in `RU_Dec25_v2(4).Rmd`; that TMT script uses different normalization (reporter-total scaling and quantile normalization). Here the existing label-free PSM median-centering is shared by QC, PCA and limma.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+source("CoPPRA_validate_inputs.R", local = TRUE)
+```
+
+
+# Read and filter evidence once
+
+Remove explicit decoys, contaminants, missing sequences and nonpositive/nonfinite label-free intensities. Then apply the protein peptide-support and raw-file detection filters below. No modification, PEP, Q-value or PSM-count filter is applied.
+
+```{r read_evidence}
+paths <- stage_paths("QC")
+qc_dir <- paths$tables
+
+# Neither modification status, modified sequence nor charge is used as a filter
+# or quantification key. Read only the fields needed by this workflow.
+ev <- fread(evidence_file, na.strings = c("", "NA"), select = c(
+  "Raw file", "Experiment", "Sequence", "Decoy", "Potential contaminant",
+  "Proteins", "Leading proteins", "Gene Names", "Protein Names", "Intensity",
+  "Protein group IDs", "Peptide ID"
+))
+setnames(ev, make.names(names(ev)))
+validate_coppra_input_pair(ev, protein_groups_file)
+n_input <- nrow(ev)
+run_assignment <- unique(ev[, .(Raw.file, Experiment)])
+
+ev <- ev[
+  (is.na(Decoy) | Decoy != "+") &
+  (is.na(Potential.contaminant) | Potential.contaminant != "+") &
+  !is.na(Sequence) & Sequence != "" & is.finite(Intensity) & Intensity > 0
+]
+```
+
+# Assign samples once
+
+
+
+```{r sample_metadata}
+sample_map <- data.table(
+  Experiment = c(paste0("R", 1:3), paste0("U", 1:3), paste0("RU", 1:3),
+                 paste0("Ctrl", 1:3), paste0("Carrier", 1:3)),
+  Condition = factor(rep(c("R", "U", "RU", "Ctrl", "Carrier"), each = 3),
+                     levels = c("R", "U", "RU", "Ctrl", "Carrier")),
+  Bio_rep = rep(1:3, 5), Sample_order = 1:15
+)
+runs <- merge(run_assignment, sample_map, by = "Experiment", all.x = TRUE)
+runs[, Tech_rep := as.integer(sub(".*_", "", Raw.file))]
+
+# One input-level check protects sample labels throughout the entire series.
+stopifnot(!anyNA(runs), !anyDuplicated(runs$Raw.file),
+          setequal(runs$Experiment, sample_map$Experiment),
+          all(runs[, uniqueN(Tech_rep), by = Experiment]$V1 == 3L),
+          all(runs$Tech_rep %in% 1:3), nrow(runs) == 45L)
+setorder(runs, Sample_order, Tech_rep)
+samples <- merge(sample_map, runs[, .(Technical_runs = .N), by = Experiment],
+                 by = "Experiment")
+setorder(samples, Sample_order)
+raw_order <- runs$Raw.file
+sample_order <- samples$Experiment
+write_tables(list(QC_raw_file_metadata = runs, QC_experiment_metadata = samples), qc_dir)
+knitr::kable(samples)
+```
+
+# Protein and peptide detection filters
+
+First retain protein accessions in `Proteins` supported by at least two distinct unmodified `Sequence` values across the evidence remaining after the existing filters. Shared peptides support each listed accession; repeated evidence rows, charges and modification forms do not count as additional peptides. Remove excluded accessions from protein annotations and discard evidence rows mapped only to excluded proteins. Rows without protein annotations retain their existing treatment.
+
+Next retain peptides detected in at least 20% of all input raw files, including carrier files (`ceiling(0.20 * 45) = 9` for this experiment). Detection requires at least one retained evidence row with positive finite intensity in a distinct raw file. Apply the protein filter only once, before the detection filter; a retained protein may therefore have one peptide after the second filter. Coverage below compares data immediately before these two added filters, after the protein filter, and after both filters. All subsequent quantification and analyses use the filtered evidence.
+
+```{r protein_peptide_filters}
+split_protein_ids <- function(x) {
+  ids <- trimws(unlist(strsplit(x[!is.na(x)], ";", fixed = TRUE)))
+  ids[nzchar(ids)]
+}
+coverage_snapshot <- function(data, stage) {
+  n_peptides <- uniqueN(data$Sequence)
+  n_detected <- nrow(unique(data[, .(Sequence, Raw.file)]))
+  data.table(
+    Stage = stage, Evidence_rows = nrow(data), Unique_peptides = n_peptides,
+    Individual_protein_accessions = uniqueN(split_protein_ids(data$Proteins)),
+    Leading_protein_groups = uniqueN(data$Leading.proteins[
+      !is.na(data$Leading.proteins) & nzchar(data$Leading.proteins)]),
+    Total_raw_files = nrow(runs), Raw_files_with_evidence = uniqueN(data$Raw.file),
+    Biological_samples_with_evidence = uniqueN(data$Experiment),
+    Peptide_raw_file_detections = n_detected,
+    Peptide_completeness = if (n_peptides > 0L) n_detected / (n_peptides * nrow(runs)) else NA_real_
+  )
+}
+coverage_before <- coverage_snapshot(ev, "Before added filters")
+
+# Count distinct sequences per accession, preserving the existing shared mappings.
+protein_map <- unique(ev[, .(Sequence, Proteins)])
+protein_map <- unique(protein_map[, .(ProteinID = split_protein_ids(Proteins)), by = Sequence])
+protein_support <- protein_map[, .(Unique_peptides = uniqueN(Sequence)), by = ProteinID]
+protein_support[, Retained := Unique_peptides >= 2L]
+retained_proteins <- protein_support[Retained == TRUE, ProteinID]
+
+# Prune annotations as well as rows so excluded accessions cannot return downstream.
+protein_annotations <- unique(ev[, .(Proteins, Leading.proteins)])
+retain_ids <- function(x) vapply(x, function(value) {
+  ids <- split_protein_ids(value)
+  paste(ids[ids %chin% retained_proteins], collapse = ";")
+}, character(1))
+protein_annotations[, `:=`(
+  Filtered_proteins = retain_ids(Proteins),
+  Filtered_leading_proteins = retain_ids(Leading.proteins),
+  Had_protein_annotation = !is.na(Proteins) & nzchar(trimws(Proteins))
+)]
+ev[protein_annotations, on = .(Proteins, Leading.proteins), `:=`(
+  Proteins = i.Filtered_proteins, Leading.proteins = i.Filtered_leading_proteins,
+  Had_protein_annotation = i.Had_protein_annotation
+)]
+ev <- ev[!Had_protein_annotation | nzchar(Proteins)]
+ev[, Had_protein_annotation := NULL]
+coverage_after_protein <- coverage_snapshot(ev, "After protein filter")
+
+# The denominator is fixed before filtering, including runs losing all evidence.
+minimum_raw_files <- ceiling(0.20 * nrow(runs))
+peptide_detection <- ev[, .(Raw_files_detected = uniqueN(Raw.file)), by = Sequence]
+peptide_detection[, `:=`(Total_raw_files = nrow(runs), Minimum_raw_files = minimum_raw_files,
+  Retained = Raw_files_detected >= minimum_raw_files)]
+ev <- ev[Sequence %chin% peptide_detection[Retained == TRUE, Sequence]]
+coverage_before_after <- rbindlist(list(coverage_before, coverage_after_protein,
+  coverage_snapshot(ev, "After both filters")))
+coverage_before_after[, Peptide_missingness := 1 - Peptide_completeness]
+filter_summary <- data.table(
+  Metric = c("Input evidence rows", "Quantified target rows retained", "Rows removed",
+    "Rows before added filters", "Rows removed by protein filter",
+    "Rows removed by peptide detection filter", "Minimum distinct peptides per protein accession",
+    "Minimum raw-file detection fraction", "Total input raw files", "Minimum raw files per peptide"),
+  Value = c(n_input, nrow(ev), n_input - nrow(ev), coverage_before$Evidence_rows,
+    coverage_before$Evidence_rows - coverage_after_protein$Evidence_rows,
+    coverage_after_protein$Evidence_rows - nrow(ev), 2L, 0.20, nrow(runs), minimum_raw_files)
+)
+write_tables(list(QC_filter_summary = filter_summary,
+  QC_coverage_before_after = coverage_before_after,
+  QC_protein_peptide_support = protein_support,
+  QC_peptide_raw_file_detection = peptide_detection), qc_dir)
+knitr::kable(filter_summary)
+knitr::kable(coverage_before_after, digits = 4)
+if (!nrow(ev)) stop("No evidence remains after the protein and peptide detection filters.")
+```
+
+# PSM normalization and sequence quantification
+
+Log2-transform and median-centre evidence intensities within each raw file, then take the median by unmodified `Sequence`. Aggregate available technical-run log2 values by another median. Missing values stay `NA`. The raw linear median is exported for descriptive intensity QC; the normalized log2 matrix is the shared analysis input.
+
+```{r quantification}
+ev[, PSM_log2_intensity := log2(Intensity)]
+ev[, Raw_file_median := median(PSM_log2_intensity), by = Raw.file]
+ev[, PSM_normalized_log2 := PSM_log2_intensity - Raw_file_median]
+
+norm <- ev[, .(
+  Evidence_rows = .N,
+  Raw_median_log2 = Raw_file_median[1L],
+  Median_after_normalization = median(PSM_normalized_log2),
+  IQR_after_normalization = IQR(PSM_normalized_log2)
+), by = .(Raw.file, Experiment)]
+norm <- merge(runs, norm, by = c("Raw.file", "Experiment"), all.x = TRUE)
+setorder(norm, Sample_order, Tech_rep)
+
+# Every retained evidence row has equal weight within its Sequence/raw-file group.
+# Modified and unmodified forms (and different charges) are pooled here.
+pep_run <- ev[, .(
+  Peptide_intensity = median(Intensity),
+  Norm_log2 = median(PSM_normalized_log2),
+  PSM_count = .N
+), by = .(Sequence, Raw.file, Experiment)]
+pep_run[, Norm_intensity := 2^Norm_log2]
+
+# Technical runs have equal weight within each biological sample.
+pep_sample <- pep_run[, .(
+  Peptide_intensity = median(Peptide_intensity),
+  Norm_log2 = median(Norm_log2),
+  Runs_detected = uniqueN(Raw.file),
+  Total_PSM_count = sum(PSM_count)
+), by = .(Sequence, Experiment)]
+pep_sample[, Norm_intensity := 2^Norm_log2]
+pep_sample_norm <- pep_sample[, .(Sequence, Experiment, Norm_intensity, Runs_detected)]
+
+# Union annotations across contributing rows; do not choose only the first row.
+# Annotation availability never removes an otherwise valid quantitative signal.
+collapse_ids <- function(x) {
+  ids <- trimws(unlist(strsplit(x[!is.na(x)], ";", fixed = TRUE)))
+  paste(sort(unique(ids[nzchar(ids)])), collapse = ";")
+}
+peptide_annotation <- ev[, .(
+  Proteins = collapse_ids(Proteins),
+  Leading_proteins = collapse_ids(Leading.proteins),
+  Gene_Names = collapse_ids(Gene.Names),
+  Protein_Names = collapse_ids(Protein.Names)
+), by = Sequence]
+
+raw_mat <- to_matrix(pep_run, "Raw.file", "Peptide_intensity", raw_order)
+raw_log2 <- to_matrix(pep_run, "Raw.file", "Norm_log2", raw_order)
+raw_norm <- 2^raw_log2
+sample_mat <- to_matrix(pep_sample, "Experiment", "Peptide_intensity", sample_order)
+sample_log2 <- to_matrix(pep_sample, "Experiment", "Norm_log2", sample_order)
+sample_norm <- 2^sample_log2
+
+write_tables(list(
+  QC_PSM_normalization_summary = norm,
+  peptide_by_raw_file = pep_run,
+  peptide_by_biological_experiment = pep_sample,
+  peptide_annotations = peptide_annotation,
+  peptide_normalized_log2_raw_file_matrix = matrix_table(raw_log2),
+  peptide_normalized_log2_biological_matrix = matrix_table(sample_log2)
+), qc_dir)
+```
+
+# Coverage and completeness
+
+Peptide depth counts distinct unmodified sequences. Protein depth counts distinct leading protein groups. Completeness uses the union of all retained peptide sequences; missing values are not imputed.
+
+```{r coverage}
+count_groups <- function(x) uniqueN(x[!is.na(x) & x != ""])
+coverage <- function(data, groups) {
+  data[, .(Evidence_rows = .N, Unique_peptides = uniqueN(Sequence),
+    Leading_protein_groups = count_groups(Leading.proteins),
+    Total_intensity = sum(Intensity), Median_log2_intensity = median(log2(Intensity))),
+    by = groups]
+}
+run_cov <- merge(runs, coverage(ev, c("Raw.file", "Experiment")),
+                  by = c("Raw.file", "Experiment"), all.x = TRUE)
+sample_cov <- merge(samples, coverage(ev, "Experiment"), by = "Experiment", all.x = TRUE)
+setorder(run_cov, Sample_order, Tech_rep)
+setorder(sample_cov, Sample_order)
+run_cov[, Peptide_missingness := colMeans(is.na(raw_mat))[Raw.file]]
+sample_cov[, Peptide_missingness := colMeans(is.na(sample_mat))[Experiment]]
+run_cov[, Peptide_completeness := 1 - Peptide_missingness]
+sample_cov[, Peptide_completeness := 1 - Peptide_missingness]
+
+condition_evidence <- merge(ev[, .(Experiment, Raw.file, Sequence, Leading.proteins)],
+                            sample_map[, .(Experiment, Condition)], by = "Experiment")
+condition_cov <- condition_evidence[, .(
+  Biological_samples = uniqueN(Experiment), Raw_files = uniqueN(Raw.file),
+  Unique_peptides = uniqueN(Sequence), Leading_protein_groups = count_groups(Leading.proteins)
+), by = Condition]
+setorder(condition_cov, Condition)
+protein_ids <- trimws(unlist(strsplit(unique(na.omit(ev$Proteins)), ";", fixed = TRUE)))
+overall_cov <- data.table(
+  Metric = c("Raw files", "Biological samples", "Conditions", "Unique peptide sequences",
+    "Unique leading protein groups", "Unique individual protein accessions",
+    "Median peptides per raw file", "Median leading protein groups per raw file"),
+  Value = c(nrow(runs), nrow(samples), uniqueN(samples$Condition), uniqueN(ev$Sequence),
+    count_groups(ev$Leading.proteins), count_groups(protein_ids),
+    median(run_cov$Unique_peptides, na.rm = TRUE), median(run_cov$Leading_protein_groups, na.rm = TRUE))
+)
+knitr::kable(overall_cov)
+knitr::kable(condition_cov)
+```
+
+# Technical and biological reproducibility
+
+Pearson correlations use pairwise-complete normalized log2 peptide values. Technical pairs are within biological sample; biological pairs are within condition. These are descriptive metrics and do not remove runs.
+
+```{r correlations}
+run_cor <- cor(raw_log2, use = "pairwise.complete.obs", method = "pearson")
+sample_cor <- cor(sample_log2, use = "pairwise.complete.obs", method = "pearson")
+
+correlation_pairs <- function(x) {
+  ij <- which(upper.tri(x), arr.ind = TRUE)
+  data.table(ID1 = rownames(x)[ij[, 1]], ID2 = colnames(x)[ij[, 2]], Pearson = x[ij])
+}
+all_run_pairs <- correlation_pairs(run_cor)
+tech_pairs <- merge(all_run_pairs, runs[, .(ID1 = Raw.file, Experiment, Condition,
+                    Sample_order, Tech1 = Tech_rep)], by = "ID1")
+tech_pairs <- merge(tech_pairs, runs[, .(ID2 = Raw.file, Sample2 = Experiment,
+                    Tech2 = Tech_rep)], by = "ID2")
+tech_pairs <- tech_pairs[Experiment == Sample2, .(Experiment, Condition, Sample_order,
+                         Run1 = ID1, Run2 = ID2, Tech1, Tech2, Pearson)]
+setorder(tech_pairs, Sample_order, Tech1, Tech2)
+tech_cor_summary <- tech_pairs[, .(Technical_pairs = .N,
+  Median_Pearson = median(Pearson, na.rm = TRUE), Mean_Pearson = mean(Pearson, na.rm = TRUE),
+  Minimum_Pearson = min(Pearson, na.rm = TRUE)), by = .(Experiment, Condition, Sample_order)]
+
+run_pair_means <- rbind(tech_pairs[, .(Raw.file = Run1, Pearson)],
+                        tech_pairs[, .(Raw.file = Run2, Pearson)])[, .(
+  Mean_within_sample_Pearson = mean(Pearson, na.rm = TRUE)), by = Raw.file]
+run_cov <- merge(run_cov, run_pair_means, by = "Raw.file", all.x = TRUE)
+setorder(run_cov, Sample_order, Tech_rep)
+
+bio_pairs <- merge(correlation_pairs(sample_cor), samples[, .(
+  ID1 = Experiment, Condition, Rep1 = Bio_rep)], by = "ID1")
+bio_pairs <- merge(bio_pairs, samples[, .(ID2 = Experiment, Condition2 = Condition,
+  Rep2 = Bio_rep)], by = "ID2")
+bio_pairs <- bio_pairs[Condition == Condition2, .(Condition,
+  Sample1 = ID1, Sample2 = ID2, Rep1, Rep2, Pearson)]
+setorder(bio_pairs, Condition, Rep1, Rep2)
+bio_cor_summary <- bio_pairs[, .(Biological_pairs = .N,
+  Median_Pearson = median(Pearson, na.rm = TRUE), Mean_Pearson = mean(Pearson, na.rm = TRUE),
+  Minimum_Pearson = min(Pearson, na.rm = TRUE)), by = Condition]
+setnames(all_run_pairs, c("ID1", "ID2"), c("Run1", "Run2"))
+knitr::kable(tech_cor_summary, digits = 3)
+knitr::kable(bio_cor_summary, digits = 3)
+```
+
+# Peptide coefficients of variation
+
+CV = 100 x sample SD / arithmetic mean, on the normalized linear scale (`2^Norm_log2`). Missing observations are not imputed; peptides observed once have undefined CV.
+
+```{r peptide_cv}
+tech_cv <- pep_run[, .(Technical_runs_detected = uniqueN(Raw.file),
+  Mean_intensity = mean(Norm_intensity), SD_intensity = sd(Norm_intensity)),
+  by = .(Experiment, Sequence)]
+tech_cv[, CV_percent := 100 * SD_intensity / Mean_intensity]
+tech_cv <- merge(tech_cv, samples[, .(Experiment, Condition, Sample_order)], by = "Experiment")
+setorder(tech_cv, Sample_order, Sequence)
+
+bio_values <- merge(pep_sample_norm, sample_map[, .(Experiment, Condition)], by = "Experiment")
+bio_cv <- bio_values[, .(Biological_replicates_detected = uniqueN(Experiment),
+  Mean_intensity = mean(Norm_intensity), SD_intensity = sd(Norm_intensity)),
+  by = .(Condition, Sequence)]
+bio_cv[, CV_percent := 100 * SD_intensity / Mean_intensity]
+setorder(bio_cv, Condition, Sequence)
+
+summarize_cv <- function(data, groups) {
+  data[, .(Peptides_total = .N, Peptides_with_estimable_CV = sum(is.finite(CV_percent)),
+    Median_CV_percent = median(CV_percent, na.rm = TRUE),
+    CV_Q25_percent = quantile(CV_percent, 0.25, na.rm = TRUE),
+    CV_Q75_percent = quantile(CV_percent, 0.75, na.rm = TRUE)), by = groups]
+}
+tech_cv_summary <- summarize_cv(tech_cv, c("Experiment", "Condition", "Sample_order"))
+bio_cv_summary <- summarize_cv(bio_cv, "Condition")
+knitr::kable(tech_cv_summary, digits = 2)
+knitr::kable(bio_cv_summary, digits = 2)
+```
+
+# Export QC tables once
+
+
+
+```{r qc_tables}
+qc_summary <- data.table(
+  Metric = c("Quantified target evidence rows", "Raw files", "Biological samples",
+    "Unique peptide sequences", "Unique leading protein groups", "Overall peptide missingness",
+    "Median technical-pair Pearson after normalization",
+    "Median within-condition biological-pair Pearson after normalization",
+    "Median peptide technical-run CV (%) after normalization",
+    "Median peptide biological-replicate CV (%) after normalization"),
+  Value = c(nrow(ev), nrow(runs), nrow(samples), uniqueN(ev$Sequence),
+    count_groups(ev$Leading.proteins), mean(is.na(raw_mat)),
+    median(tech_pairs$Pearson, na.rm = TRUE), median(bio_pairs$Pearson, na.rm = TRUE),
+    median(tech_cv$CV_percent, na.rm = TRUE), median(bio_cv$CV_percent, na.rm = TRUE))
+)
+write_tables(list(
+  QC_coverage_overall = overall_cov, QC_coverage_by_condition = condition_cov,
+  QC_raw_file_metrics = run_cov, QC_experiment_metrics = sample_cov,
+  QC_pairwise_raw_file_correlations = all_run_pairs,
+  QC_technical_replicate_correlations = tech_pairs,
+  QC_technical_replicate_correlation_summary = tech_cor_summary,
+  QC_biological_replicate_correlations = bio_pairs,
+  QC_biological_replicate_correlation_summary = bio_cor_summary,
+  QC_peptide_technical_CV = tech_cv, QC_peptide_CV_by_experiment = tech_cv_summary,
+  QC_peptide_biological_CV = bio_cv, QC_peptide_CV_by_condition = bio_cv_summary,
+  QC_integrated_summary = qc_summary
+), qc_dir)
+knitr::kable(qc_summary, digits = 4)
+```
+
+# Save handoffs for later stages
+
+All later analyses use `QC/data/quantification.rds`. Protein coverage counts distinct leading protein groups, not protein sequence coverage. Correlations use pairwise-complete normalized log2 values; CV uses `2^Norm_log2` with no imputation. Single observations have undefined CV.
+
+```{r save_handoffs}
+quantification <- list(
+  sample_map = sample_map, runs = runs, samples = samples,
+  raw_log2 = raw_log2, biological_log2 = sample_log2,
+  peptide_annotation = peptide_annotation,
+  n_evidence = nrow(ev), filter_summary = filter_summary,
+  input_files = list(evidence = evidence_file, protein_groups = protein_groups_file),
+  coverage_before_after = coverage_before_after,
+  method = list(modified_signals_included = TRUE, modified_rows_filtered = FALSE,
+    minimum_peptides_per_protein_accession = 2L,
+    minimum_raw_file_detection_fraction = 0.20, minimum_raw_files_per_peptide = minimum_raw_files,
+    filter_order = "protein peptide support, then peptide raw-file detection",
+    modification_forms_distinguished = FALSE, aggregation_key = "Sequence",
+    aggregation = "median of normalized log2 evidence within raw file",
+    normalization = "log2 evidence intensity minus raw-file evidence median",
+    technical_aggregation = "median of available technical-run log2 values",
+    modification_specific_quantification = FALSE)
+)
+saveRDS(quantification, file.path(paths$data, "quantification.rds"))
+saveRDS(list(pep_run = pep_run[, .(Raw.file, Peptide_intensity)],
+  runs = runs, samples = samples, run_cov = run_cov, sample_cov = sample_cov,
+  raw_order = raw_order, sample_order = sample_order,
+  run_cor = run_cor, sample_cor = sample_cor),
+  file.path(paths$data, "QC_plot_data.rds"))
+save_session(paths$root)
+```

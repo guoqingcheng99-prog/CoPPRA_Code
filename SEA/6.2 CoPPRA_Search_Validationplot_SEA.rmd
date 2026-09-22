@@ -1,0 +1,82 @@
+---
+title: "7.1 Base versus PTM detection and modification plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after the 7.1 analysis. This file only reads saved counts and sets. PNGs use 600 dpi; PDFs are vector output. Categories are nonexclusive because one modified form may contain multiple modification types.
+
+```{r setup}
+source("CoPPRA_config_SEA.R",local=TRUE)
+source("CoPPRA_validation_SEA.R",local=TRUE)
+library(ggplot2)
+validation_theme_SEA()
+paths_SEA <- stage_paths_SEA("Search_validation")
+plot_folder_SEA <- paths_SEA$plots
+x <- readRDS(file.path(paths_SEA$data,"Search_validation_SEA.rds"))
+
+clean_plot_text_SEA <- function(p) {
+  p +
+    labs(subtitle = NULL, caption = NULL, tag = NULL) +
+    theme(
+      plot.subtitle = element_blank(),
+      plot.caption = element_blank(),
+      plot.tag = element_blank()
+    )
+}
+```
+
+# Plot detection overlap
+
+```{r venn,fig.width=8,fig.height=6}
+entity_titles <- c(Peptide_sequences="Peptide sequence overlap",Modified_forms="Modified-sequence",
+  Protein_accessions="Protein accession overlap",Protein_groups="Protein-group")
+for (scope in names(x$sets)) for (entity in names(x$sets[[scope]]$Base)) {
+  sets <- lapply(x$sets[[scope]],`[[`,entity)
+  p <- venn_validation(sets,entity_titles[[entity]])
+  p <- clean_plot_text_SEA(p)
+  print(p);save_plot_SEA(p,paste(scope,entity,"Venn",sep="_"),3,3,dpi=600)
+}
+```
+
+# Plot modification categories and combinations
+
+```{r modifications,fig.width=9,fig.height=6}
+z <- copy(x$modification_categories[Scope=="All samples"])
+z <- merge(CJ(Dataset=c("Base","SEA"),Category=unique(z$Category)),z,by=c("Dataset","Category"),all.x=TRUE)
+for (j in c("Sequences","Modified_forms","Evidence_rows")) set(z,which(is.na(z[[j]])),j,0L)
+for (metric in c("Sequences","Modified_forms")) {
+  p <- ggplot(z,aes(x=Category,y=.data[[metric]],fill=Dataset))+
+    geom_col(position=position_dodge(width=.8),width=.7)+
+    coord_flip()+scale_y_continuous(expand=expansion(mult=c(0,.05)))+
+    scale_fill_manual(values=c(Base="#2878B5",SEA="#E88931"), labels=display_label_SEA)+
+    labs(title="Detected modification categories",
+      x=NULL,y=if(metric=="Sequences") "Unique peptide sequences" else "Unique modified-sequence forms")+
+    theme(legend.position="top")
+  p <- clean_plot_text_SEA(p)
+  print(p);save_plot_SEA(p,paste0("Modification_categories_",metric),6.5,4,dpi=600)
+}
+z <- copy(x$modification_combinations[Dataset=="SEA" & Scope=="All samples" & Modifications!="Unmodified"])
+z[,Label:=factor(Modifications,levels=Modifications[order(Modified_forms)])]
+p <- ggplot(z,aes(Modified_forms,Label))+geom_col(fill="#E88931")+
+  scale_x_continuous(expand=expansion(mult=c(0,.05)))+
+  scale_y_discrete(labels=function(x) vapply(x,function(s) paste(strwrap(s,35),collapse="\n"),character(1)))+
+  labs(title="PTM modified peptide forms",y=NULL)
+p <- clean_plot_text_SEA(p)
+print(p);save_plot_SEA(p,"SEA_modification_combinations",6.5,4,dpi=600)
+z <- melt(copy(x$added_Phospho_STY_summary),id.vars="Scope",
+  measure.vars=c("Sequences","Modified_forms","Protein_groups"),variable.name="Metric",value.name="Count")
+p <- ggplot(z,aes(Scope,Count,fill=Metric))+geom_col(position=position_dodge(.8),width=.7)+
+  scale_x_discrete(labels=display_label_SEA)+
+  scale_y_continuous(expand=expansion(mult=c(0,.05)))+
+  scale_fill_manual(values=c(Sequences="#2878B5",Modified_forms="#E88931",Protein_groups="#43A047"),
+    labels=c("Peptide sequences","Modified forms","Protein groups"))+
+  labs(title="Added phosphorylation evidence",x=NULL,y="Count",fill=NULL)+
+  theme(legend.position="bottom")
+p <- clean_plot_text_SEA(p)
+print(p);save_plot_SEA(p,"Added_Phospho_STY_evidence",6.5,3.8,dpi=600)
+save_session_SEA(paths_SEA$plots)
+```
