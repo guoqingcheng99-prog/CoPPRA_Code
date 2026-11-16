@@ -18,3 +18,12 @@ results/
 *.mzXML
 evidence*.txt
 proteinGroups*.txt
+
+# DIA-NN inputs, generated figures, and machine-specific dependencies
+Raw_Data/
+plot/
+R_library/
+.venv*/
+__pycache__/
+*.pyc
+Rplots.pdf

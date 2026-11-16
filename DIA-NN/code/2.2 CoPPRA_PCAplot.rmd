@@ -1,0 +1,191 @@
+---
+title: "2.2 CoPPRA PCA plots"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run after 2.1. In the 2D and Figure 2A-style 3D plots, faint gray markers represent individual biological samples and bright colored markers represent the arithmetic mean of each condition's saved PCA scores. The grouped 3D companion shows individual samples connected by triangles, which are not confidence regions.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(ggplot2)
+```
+
+
+# Read saved PCA results
+
+
+
+```{r read_pca}
+paths <- stage_paths("PCA")
+plot_folder <- paths$plots
+list2env(readRDS(file.path(paths$data, "PCA_plot_data.rds")), envir = environment())
+```
+
+# PCA by predefined treatment group
+
+
+
+```{r plot_peptide_pca_2d, fig.width=9, fig.height=7}
+pc1_variance <- round(pca_variance$Variance_percent[1], 2)
+pc2_variance <- round(pca_variance$Variance_percent[2], 2)
+
+# Arithmetic condition means on the existing fitted PC1/PC2 axes.
+pca_centroids_2d <- pca_scores[, .(
+  n = .N,
+  PC1 = mean(PC1),
+  PC2 = mean(PC2)
+), by = PCA_group]
+fwrite(pca_centroids_2d, file.path(paths$tables, "PCA_2D_group_centroids.csv"))
+
+group_colors <- c(
+  Ctrl = "#1F77B4",
+  R = "#D62728",
+  U = "#2CA02C",
+  RU = "#FF7F0E"
+)
+
+p_pca_2d <- ggplot() +
+  geom_point(
+    data = pca_scores,
+    aes(x = PC1, y = PC2, shape = PCA_group),
+    color = "#B8B8B8",
+    size = 2.4,
+    alpha = 0.65,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = pca_centroids_2d,
+    aes(
+      x = PC1,
+      y = PC2,
+      color = PCA_group,
+      shape = PCA_group
+    ),
+    size = 4.5,
+    alpha = 1
+  ) +
+  scale_color_manual(values = group_colors, limits = c("Ctrl", "R", "U", "RU"), drop = TRUE) +
+  scale_shape_manual(
+    values = c(Ctrl = 16, R = 17, U = 15, RU = 18),
+    limits = c("Ctrl", "R", "U", "RU"),
+    drop = TRUE
+  ) +
+  labs(
+    title = "Peptide-level PCA by Experimental Group",
+    x = paste0("PC1 (", pc1_variance, "% variance)"),
+    y = paste0("PC2 (", pc2_variance, "% variance)"),
+    color = "Experiment",
+    shape = "Experiment"
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#E5E5E5", linewidth = 0.35),
+    legend.position = "right",
+    legend.box.spacing = grid::unit(0.15, "cm")
+  )
+
+print(p_pca_2d)
+
+save_plot(p_pca_2d, "PCA_peptide_2D_grouped", 8, 6, dpi = 600)
+```
+
+# Three-dimensional PCA
+
+The Figure 2A-style view emphasizes group means (colored markers) and retains all
+12 individual biological samples as faint gray markers. The companion view shows
+labeled replicates with translucent group triangles, which are not confidence
+regions. Both use the same orthographic camera, axis limits, and equal data units.
+The camera foreshortens the control group's spread in projection. The saved
+PC1–PC3 scores, actual distances, and explained variances are unchanged. The PNGs
+contain the title, axis labels/ticks, legend, and sample labels in the grouped
+view; definitions and camera provenance are retained here and in the metadata.
+
+```{r plot_peptide_pca_3d, fig.width=4.5, fig.height=4.5, out.width="100%"}
+# Matplotlib reproduces the paper's three-wall grid and supports independent
+# azimuth/elevation control. This helper is part of the normal PCA plotting stage.
+# Override COPPRA_PCA_PYTHON to use another Python with requirements-pca.txt.
+pca_python <- Sys.getenv("COPPRA_PCA_PYTHON",
+  file.path(package_root, "code", ".venv-pca", "bin", "python"))
+if (!file.exists(pca_python)) {
+  stop("Missing PCA Python environment. Create code/.venv-pca and install ",
+       "code/requirements-pca.txt, or set COPPRA_PCA_PYTHON.")
+}
+pc_names_3d <- c("PC1", "PC2", "PC3")
+stopifnot(all(pc_names_3d %in% names(pca_scores)),
+          all(is.finite(as.matrix(pca_scores[, ..pc_names_3d]))))
+# Export the RDS scores consumed by this stage, so the renderer uses precisely
+# the same fitted PCA as the 2D figure, even if older CSV exports exist.
+pca_3d_scores_file <- file.path(paths$tables, "PCA_3D_sample_scores.csv")
+pca_3d_variance_file <- file.path(paths$tables, "PCA_3D_variance.csv")
+fwrite(pca_scores[, c("label", "PCA_group", pc_names_3d), with = FALSE],
+       pca_3d_scores_file)
+fwrite(pca_variance[, .(PC, Variance_percent)], pca_3d_variance_file)
+
+# Fixed, reproducible camera selected for readable samples and axes. Only the
+# viewing direction changes; no group-specific movement or scaling is applied.
+pca_view_elevation <- 30
+pca_view_azimuth <- 165
+pca_render_status <- system2(pca_python, c(
+  shQuote(file.path(package_root, "code", "plot_PCA_3D.py")),
+  "--scores", shQuote(pca_3d_scores_file),
+  "--variance", shQuote(pca_3d_variance_file),
+  "--output-dir", shQuote(plot_folder),
+  "--tables-dir", shQuote(paths$tables),
+  "--label", shQuote(analysis_label),
+  "--elev", pca_view_elevation, "--azim", pca_view_azimuth))
+if (pca_render_status != 0L) stop("3D PCA rendering failed.")
+
+pca_3d_png <- file.path(plot_folder, "PCA_peptide_3D_Figure2A_style.png")
+pca_3d_replicates_png <- file.path(plot_folder, "PCA_peptide_3D_grouped.png")
+knitr::include_graphics(c(pca_3d_png, pca_3d_replicates_png))
+```
+
+# Variance explained
+
+
+
+```{r plot_pca_variance_95, fig.width=9, fig.height=7}
+pca_variance_plot <- copy(pca_variance_95)
+pca_variance_plot[, PC := factor(PC, levels = PC)]
+
+p_pca_variance <- ggplot(
+  pca_variance_plot,
+  aes(x = PC, y = Variance_percent)
+) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(
+      label = paste0(
+        round(Variance_percent, 1),
+        "%\nCum. ",
+        round(Cumulative_variance_percent, 1),
+        "%"
+      )
+    ),
+    vjust = -0.25,
+    size = 3.5
+  ) +
+  labs(
+    title = "First Principal Components Explaining at Least 95% Variance",
+    x = "Principal component",
+    y = "Variance explained (%)"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  ) +
+  expand_limits(
+    y = max(pca_variance_plot$Variance_percent, na.rm = TRUE) * 1.15
+  )
+
+print(p_pca_variance)
+
+save_plot(p_pca_variance, "PCA_peptide_variance_first_95pct_barplot", 9, 6, dpi = 600)
+```

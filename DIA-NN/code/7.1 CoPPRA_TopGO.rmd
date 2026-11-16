@@ -1,0 +1,436 @@
+---
+title: "7.1 CoPPRA topGO biological concept analysis"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+date: "`r format(Sys.Date())`"
+---
+
+Run independently after 3.1 using `Limma/data/Limma_results.rds` and the adjacent `CoPPRA_config.R`. Rebuild R, U and RU ranked lists with the same scoring and mapping as 4.1, obtain GO annotations from the installed databases, and run KEGG GSEA here. No 4.1 result or previous R session is required. KEGG requires internet access. Test GO BP/MF/CC with classic topGO KS in both rank directions; combine the two one-sided P values as min(1, 2 * min(P_up, P_down)), then apply BH within each ontology and contrast. Operational CT concepts pass adjusted P < 0.10 in RU and are nonsignificant or unavailable in R and U. This is an operational comparison, not an interaction test. The GO method comparison was exploratory. Packages must be installed before running the series.
+
+```{r setup}
+source("CoPPRA_config.R", local = TRUE)
+library(dplyr)
+library(readr)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GO.db)
+library(topGO)
+library(enrichplot)
+```
+
+# Read ranked inputs and set parameters
+
+```{r read_results}
+paths <- stage_paths("TopGO")
+table_folder <- paths$tables
+minimum_pathway_size <- 15L
+maximum_pathway_size <- 500L
+minimum_reported_size <- 6L
+adjusted_p_cutoff <- 0.10
+minimum_term_similarity <- 0.20
+show_category <- 12L
+graph_node_size <- 5L
+set.seed(2026)
+
+input_file <- file.path(output_root, "Limma", "data", "Limma_results.rds")
+if (!file.exists(input_file)) stop("Missing saved Limma input: ", input_file,
+  ". Run 3.1 once before starting 7.1 independently.")
+input_hash <- unname(tools::md5sum(input_file))
+peptide_results <- data.table::as.data.table(
+  data.table::copy(readRDS(input_file)$peptide_significance))
+required_columns <- c("Sequence", "Proteins",
+  "Ru_vs_Control_limma_logFC", "Ru_vs_Control_pvalue",
+  "Ul_vs_Control_limma_logFC", "Ul_vs_Control_pvalue",
+  "RU_vs_Control_limma_logFC", "RU_vs_Control_pvalue")
+missing_columns <- setdiff(required_columns, names(peptide_results))
+if (length(missing_columns)) stop("Limma input is missing columns: ",
+  paste(missing_columns, collapse = ", "))
+```
+
+# Calculate protein scores and map UniProt to Entrez IDs
+
+The scoring, accession aggregation, mapping and deterministic tie-breaking are
+identical to 4.1; enrichment does not read or execute that stage.
+
+```{r protein_scores}
+signed_z <- function(log_fc, p_value) {
+  # Keep unavailable statistics unavailable; only clamp finite P values at zero.
+  p_value <- pmin(pmax(p_value, .Machine$double.xmin), 1)
+  sign(log_fc) * stats::qnorm(p_value / 2, lower.tail = FALSE)
+}
+
+peptide_results[, `:=`(
+  Ru_score = signed_z(
+    Ru_vs_Control_limma_logFC,
+    Ru_vs_Control_pvalue
+  ),
+  Ul_score = signed_z(
+    Ul_vs_Control_limma_logFC,
+    Ul_vs_Control_pvalue
+  ),
+  RU_score = signed_z(
+    RU_vs_Control_limma_logFC,
+    RU_vs_Control_pvalue
+  )
+)]
+
+protein_score_long <- peptide_results[
+  !is.na(Proteins) & Proteins != "",
+  .(
+    ProteinID = trimws(unlist(strsplit(
+      Proteins,
+      ";",
+      fixed = TRUE
+    )))
+  ),
+  by = .(
+    Sequence,
+    Ru_score,
+    Ul_score,
+    RU_score
+  )
+]
+
+protein_score_long <- unique(protein_score_long[ProteinID != ""], by = c("Sequence", "ProteinID"))
+
+protein_scores <- protein_score_long[, .(
+  n_peptides = uniqueN(Sequence),
+  R_score = median(Ru_score, na.rm = TRUE),
+  U_score = median(Ul_score, na.rm = TRUE),
+  RU_score = median(RU_score, na.rm = TRUE)
+), by = ProteinID]
+
+protein_scores[, UniProt := sub("-\\d+$", "", ProteinID)]
+
+cat("Protein accessions with ranking scores:", nrow(protein_scores), "\n")
+```
+
+```{r protein_mapping}
+uniprot_ids <- unique(protein_scores$UniProt)
+
+id_map <- clusterProfiler::bitr(
+  uniprot_ids,
+  fromType = "UNIPROT",
+  toType = c("ENTREZID", "SYMBOL"),
+  OrgDb = org.Hs.eg.db
+) %>%
+  dplyr::distinct(UNIPROT, ENTREZID, SYMBOL)
+
+protein_scores_mapped <- protein_scores %>%
+  dplyr::inner_join(
+    id_map,
+    by = c("UniProt" = "UNIPROT")
+  ) %>%
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(
+    SYMBOL = paste(sort(unique(SYMBOL)), collapse = ";"),
+    UniProt = paste(sort(unique(UniProt)), collapse = ";"),
+    n_accessions = dplyr::n_distinct(ProteinID),
+    n_peptides = sum(n_peptides),
+    R_score = median(R_score, na.rm = TRUE),
+    U_score = median(U_score, na.rm = TRUE),
+    RU_score = median(RU_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  id_map,
+  file.path(table_folder, "uniprot_to_entrez_mapping.csv")
+)
+
+readr::write_csv(
+  protein_scores_mapped,
+  file.path(table_folder, "protein_rank_scores.csv")
+)
+
+mapping_summary <- tibble::tibble(
+  Metric = c(
+    "Protein accessions before mapping",
+    "Mapped Entrez IDs used for ranking"
+  ),
+  Value = c(
+    nrow(protein_scores),
+    nrow(protein_scores_mapped)
+  )
+)
+
+readr::write_csv(
+  mapping_summary,
+  file.path(table_folder, "ranking_mapping_summary.csv")
+)
+
+print(mapping_summary)
+```
+
+# Build ranked lists
+
+```{r ranked_lists}
+make_ranked_list <- function(data, score_column) {
+  score <- data[[score_column]]
+  names(score) <- as.character(data$ENTREZID)
+
+  score <- score[is.finite(score) & !is.na(names(score))]
+
+  tie_break <- rank(
+    names(score),
+    ties.method = "first"
+  ) / length(score)
+
+  score <- score + tie_break * 1e-12
+  sort(score, decreasing = TRUE)
+}
+
+ranked_lists <- list(
+  R = make_ranked_list(protein_scores_mapped, "R_score"),
+  U = make_ranked_list(protein_scores_mapped, "U_score"),
+  RU = make_ranked_list(protein_scores_mapped, "RU_score")
+)
+
+stopifnot(length(ranked_lists) == 3L,
+  all(vapply(ranked_lists, function(x) is.numeric(x) && length(x) > 0L &&
+    all(is.finite(x)) && !is.null(names(x)) && !anyNA(names(x)) &&
+    all(nzchar(names(x))) && !anyDuplicated(names(x)), logical(1))))
+
+rank_summary <- data.frame(Contrast = names(ranked_lists),
+  n_ranked_genes = lengths(ranked_lists),
+  minimum_score = vapply(ranked_lists, min, numeric(1)),
+  maximum_score = vapply(ranked_lists, max, numeric(1)))
+write_csv(rank_summary, file.path(table_folder, "ranked_list_summary.csv"))
+for (contrast in names(ranked_lists)) {
+  score <- ranked_lists[[contrast]]
+  write_csv(data.frame(ENTREZID = names(score), Score = unname(score)),
+    file.path(table_folder, paste0(contrast, "_ranked_background.csv")))
+}
+print(rank_summary)
+```
+
+# Prepare GO annotations directly from the installed databases
+
+```{r go_annotations}
+measured_genes <- unique(unlist(lapply(ranked_lists, names), use.names = FALSE))
+go_annotation <- AnnotationDbi::select(org.Hs.eg.db,
+  keys = measured_genes, keytype = "ENTREZID", columns = c("GOALL", "ONTOLOGYALL"))
+# GOALL includes ancestor annotations, matching the gene sets used by gseGO.
+go_annotation <- unique(go_annotation[!is.na(go_annotation$GOALL) &
+  !is.na(go_annotation$ONTOLOGYALL), ])
+go_ontology <- AnnotationDbi::Ontology(GO.db::GOTERM)
+go_annotation <- go_annotation[go_annotation$GOALL %in% names(go_ontology), ]
+go_gene_sets <- setNames(lapply(c("BP", "MF", "CC"), function(ontology) {
+  annotation <- go_annotation[go_ontology[go_annotation$GOALL] == ontology, ]
+  lapply(split(annotation$ENTREZID, annotation$GOALL), unique)
+}), c("GO_BP", "GO_MF", "GO_CC"))
+```
+
+# Prepare the GO graph with the measured background
+
+```{r go_graph}
+make_go_data <- function(gene_list, gene_sets, ontology) {
+  background <- names(gene_list)
+  gene_sets <- lapply(gene_sets, intersect, y = background)
+  gene_to_go <- split(rep(names(gene_sets), lengths(gene_sets)),
+                      unlist(gene_sets, use.names = FALSE))
+  root <- c(BP = "GO:0008150", MF = "GO:0003674", CC = "GO:0005575")[[ontology]]
+  # Root membership keeps unannotated measured genes in the KS null universe.
+  # It does not add them to any tested term; the root exceeds the size limit.
+  gene_to_go <- setNames(lapply(background, function(gene) {
+    unique(c(gene_to_go[[gene]], root))
+  }), background)
+  x <- new("topGOdata", ontology = ontology, allGenes = gene_list,
+    geneSel = function(x) rep(FALSE, length(x)), nodeSize = graph_node_size,
+    annot = annFUN.gene2GO, gene2GO = gene_to_go)
+  stopifnot(setequal(genes(x), background))
+  members <- genesInTerm(x)
+  eligible <- names(members)[lengths(members) >= minimum_pathway_size &
+                              lengths(members) <= maximum_pathway_size]
+  # Validate that graph propagation has not changed any tested membership.
+  stopifnot(all(vapply(eligible, function(id) {
+    setequal(members[[id]], gene_sets[[id]])
+  }, logical(1))))
+  list(data = x, members = members[eligible])
+}
+```
+
+# Run classic topGO KS for each contrast
+
+```{r topgo_tests}
+run_topgo <- function(gene_list, gene_sets, ontology) {
+  prepared <- make_go_data(gene_list, gene_sets, ontology)
+  x <- prepared$data
+  members <- prepared$members
+  up <- runTest(x, algorithm = "classic", statistic = "ks", scoreOrder = "decreasing")
+  down <- runTest(x, algorithm = "classic", statistic = "ks", scoreOrder = "increasing")
+  ids <- names(members)
+  p_up <- score(up)[ids]
+  p_down <- score(down)[ids]
+  p_two <- pmin(1, 2 * pmin(p_up, p_down))
+  direction <- ifelse(p_up <= p_down, "up", "down")
+  ranks <- rank(-gene_list)
+  # Signed KS distance is an effect descriptor, not a GSEA NES.
+  signed_ks <- vapply(seq_along(ids), function(i) {
+    inside <- ranks[members[[i]]]
+    outside <- ranks[setdiff(names(ranks), members[[i]])]
+    alternative <- if (direction[i] == "up") "greater" else "less"
+    distance <- unname(stats::ks.test(inside, outside,
+                                      alternative = alternative)$statistic)
+    if (direction[i] == "up") distance else -distance
+  }, numeric(1))
+  annotation <- AnnotationDbi::select(GO.db, keys = ids,
+                                      keytype = "GOID", columns = "TERM")
+  result <- data.frame(ID = ids, Description = annotation$TERM[match(ids, annotation$GOID)],
+    setSize = lengths(members), KSstatistic = signed_ks, Direction = direction,
+    p_up = unname(p_up), p_down = unname(p_down), pvalue = unname(p_two),
+    p.adjust = p.adjust(p_two, method = "BH"),
+    geneID = vapply(members, paste, collapse = "/", character(1)),
+    Count = lengths(members), stringsAsFactors = FALSE)
+  result <- result[order(result$p.adjust, -abs(result$KSstatistic), result$ID), ]
+  # An enrichResult is only a plotting container here; its P values are from topGO.
+  # GeneRatio describes measured term membership, not a selected-hit ORA ratio.
+  result$GeneRatio <- paste0(result$Count, "/", length(gene_list))
+  result$qvalue <- NA_real_
+  plot_result <- new("enrichResult", result = result, pvalueCutoff = 1,
+    pAdjustMethod = "BH", qvalueCutoff = 1, organism = "Homo sapiens",
+    ontology = ontology, gene = names(gene_list), keytype = "ENTREZID",
+    universe = names(gene_list), geneSets = members, readable = FALSE)
+  plot_result <- clusterProfiler::setReadable(plot_result,
+                              OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  list(result = plot_result, tests = list(up = up, down = down), table = result)
+}
+
+enrichment_results <- list()
+topgo_tests <- list()
+for (ontology in c("BP", "MF", "CC")) {
+  database <- paste0("GO_", ontology)
+  fits <- lapply(names(ranked_lists), function(contrast) {
+    run_topgo(ranked_lists[[contrast]],
+      go_gene_sets[[database]], ontology)
+  })
+  names(fits) <- names(ranked_lists)
+  enrichment_results[[database]] <- lapply(fits, `[[`, "result")
+  topgo_tests[[database]] <- lapply(fits, `[[`, "tests")
+  for (contrast in names(fits)) {
+    write_csv(fits[[contrast]]$table,
+      file.path(table_folder, paste0(database, "_", contrast, "_all_topGO.csv")))
+  }
+}
+```
+
+# Run KEGG GSEA independently
+
+```{r kegg_gsea}
+run_gse_kegg <- function(gene_list) {
+  x <- clusterProfiler::gseKEGG(
+    geneList = gene_list, organism = "hsa", keyType = "ncbi-geneid",
+    minGSSize = minimum_pathway_size, maxGSSize = maximum_pathway_size,
+    pvalueCutoff = 1, pAdjustMethod = "BH", eps = 0,
+    seed = TRUE, by = "fgsea", verbose = FALSE)
+  if (is.null(x)) stop("KEGG GSEA returned NULL; inspect gene mapping and gene-set overlap.")
+  if (nrow(x@result) == 0L) return(x)
+  clusterProfiler::setReadable(x, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+}
+enrichment_results$KEGG <- lapply(ranked_lists, run_gse_kegg)
+for (contrast in names(ranked_lists)) {
+  write_csv(as.data.frame(enrichment_results$KEGG[[contrast]]),
+    file.path(table_folder, paste0("KEGG_", contrast, "_all_GSEA.csv")))
+}
+```
+
+# Identify operational CT concepts
+
+```{r conjunctional_concepts}
+extract_contrast_result <- function(x, contrast) {
+  result <- as.data.frame(x)
+  # Keep method-specific effect columns: KSstatistic for GO and NES for KEGG.
+  result %>%
+    dplyr::select(dplyr::any_of(c("ID", "Description", "setSize", "KSstatistic",
+      "Direction", "NES", "pvalue", "p.adjust", "geneID", "core_enrichment"))) %>%
+    dplyr::rename_with(~paste0(.x, "_", contrast), -ID)
+}
+
+find_conjunctional_concepts <- function(result_list) {
+  r_only <- extract_contrast_result(result_list$R, "R")
+  u_only <- extract_contrast_result(result_list$U, "U")
+  combo <- extract_contrast_result(result_list$RU, "RU")
+  dplyr::full_join(r_only, u_only, by = "ID") %>%
+    dplyr::full_join(combo, by = "ID") %>%
+    dplyr::filter(!is.na(p.adjust_RU), p.adjust_RU < adjusted_p_cutoff,
+      is.na(p.adjust_R) | p.adjust_R >= adjusted_p_cutoff,
+      is.na(p.adjust_U) | p.adjust_U >= adjusted_p_cutoff,
+      setSize_RU >= minimum_reported_size) %>%
+    dplyr::arrange(p.adjust_RU, ID)
+}
+
+conjunctional_concepts <- lapply(enrichment_results, find_conjunctional_concepts)
+concept_summary <- data.frame(Database = names(conjunctional_concepts),
+  Method = c(rep("topGO classic KS", 3), "KEGG GSEA"),
+  n_conjunctional_concepts = vapply(conjunctional_concepts, nrow, integer(1)))
+for (database in names(conjunctional_concepts)) {
+  write_csv(conjunctional_concepts[[database]],
+    file.path(table_folder, paste0(database, "_operational_conjunctional_targeting.csv")))
+}
+write_csv(concept_summary, file.path(table_folder, "conjunctional_targeting_summary.csv"))
+print(concept_summary)
+```
+
+# Prepare network inputs and save results
+
+```{r save_biology}
+plot_inputs <- lapply(names(enrichment_results), function(database) {
+  result_list <- enrichment_results[[database]]
+  selected <- lapply(result_list, function(x) {
+    x@result <- x@result[!is.na(x@result$p.adjust) &
+      x@result$p.adjust < adjusted_p_cutoff &
+      x@result$setSize >= minimum_reported_size, , drop = FALSE]
+    x
+  })
+  ct <- result_list$RU
+  ct@result <- ct@result[ct@result$ID %in% conjunctional_concepts[[database]]$ID, , drop = FALSE]
+  selected$CT <- ct
+  lapply(selected, function(x) {
+    if (nrow(x@result) >= 2L) {
+      x <- enrichplot::pairwise_termsim(x, method = "JC",
+                                       showCategory = min(200L, nrow(x@result)))
+    }
+    x
+  })
+})
+names(plot_inputs) <- names(enrichment_results)
+parameters <- list(minimum_pathway_size = minimum_pathway_size,
+  maximum_pathway_size = maximum_pathway_size, minimum_reported_size = minimum_reported_size,
+  adjusted_p_cutoff = adjusted_p_cutoff, graph_node_size = graph_node_size,
+  GO_method = "topGO classic KS; two rank directions; 2*min(P); BH",
+  KEGG_method = "KEGG GSEA run independently with fgsea; BH",
+  GO_annotation = "org.Hs.eg.db GOALL; ontology from GO.db",
+  org_Hs_eg_db_version = as.character(packageVersion("org.Hs.eg.db")),
+  GO_db_version = as.character(packageVersion("GO.db")),
+  input_file = input_file, input_md5 = input_hash)
+saveRDS(list(enrichment_results = enrichment_results, topgo_tests = topgo_tests,
+  conjunctional_concepts = conjunctional_concepts, ranked_lists = ranked_lists,
+  parameters = parameters), file.path(paths$data, "TopGO_results.rds"))
+saveRDS(list(plot_inputs = plot_inputs, show_category = show_category,
+  minimum_term_similarity = minimum_term_similarity),
+  file.path(paths$data, "TopGO_plot_data.rds"))
+saveRDS(list(ranked_lists = ranked_lists, GO_gene_sets = go_gene_sets,
+  KEGG_gene_sets = lapply(enrichment_results$KEGG, function(x) x@geneSets),
+  input_file = input_file, input_md5 = input_hash),
+  file.path(paths$data, "TopGO_input_data.rds"))
+writeLines(c(paste("Run date:", Sys.Date()),
+  "GO: topGO classic KS; both rank directions; min(1, 2*min(P_up, P_down))",
+  "BH adjustment within each ontology and contrast; all size-eligible terms included",
+  sprintf("Measured term size: %d-%d; reported size >= %d; adjusted P < %.2f",
+    minimum_pathway_size, maximum_pathway_size, minimum_reported_size, adjusted_p_cutoff),
+  "GO graph root membership retains every measured gene in the null universe",
+  "GO plot size/network genes: all measured term members; effect: signed KS distance",
+  "Rankings rebuilt from saved Limma results using the 4.1 scoring and mapping method",
+  "GO annotation: installed org.Hs.eg.db GOALL and GO.db",
+  "KEGG: independently calculated GSEA; plot effect: NES; network genes: leading edge",
+  "Operational CT: RU significant; R and U nonsignificant or unavailable",
+  "Method comparison is exploratory; operational CT is not an interaction test",
+  paste("Input:", input_file), paste("Input MD5:", input_hash),
+  paste("topGO version:", packageVersion("topGO")),
+  "Term similarity: Jaccard; minimum edge similarity 0.20"),
+  file.path(paths$root, "analysis_parameters.txt"))
+save_session(paths$root)
+```
