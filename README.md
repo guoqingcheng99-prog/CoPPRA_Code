@@ -1,27 +1,34 @@
 # CoPPRA analysis code
 
-R and R Markdown scripts for CoPPRA proteomics analyses.
+R, R Markdown, and Python code for CoPPRA proteomics analysis from DIA-NN reports. The workflow includes input preparation, quality control, peptide quantification, PCA, heatmaps, limma differential analysis, PTM enrichment, GO/KEGG enrichment, joint sample-label permutations, and numerical validation.
 
-## Contents
+## Getting started
 
-- [`DIA-NN/`](DIA-NN/README.md): current CoPPRA workflow for DIA-NN reports, including input preparation, QC, PCA, heatmaps, limma, PTM enrichment, GO/KEGG enrichment, joint sample-label permutations, and validation. Start here for the DIA-NN analysis.
-- `Base/`: QC, PCA, limma, topGO, PEIMAN PSEA/SEA, and MGSA analyses and plots, plus shared configuration, input validation, and a runner.
-- `SEA/`: SEA QC, PCA, limma, biological concept, CT comparison, search validation, and modification analyses and plots.
+1. Follow the [DIA-NN setup guide](DIA-NN/README.md) to supply the required reports and sample metadata and install the R and Python dependencies.
+2. Run the complete workflow from the repository root:
 
-Experimental input data, fitted results, and generated figures are not included. The DIA-NN workflow uses a single input dataset with configurable paths; see its [setup and running instructions](DIA-NN/README.md).
+```sh
+PYTHON="$PWD/DIA-NN/code/.venv-pca/bin/python" sh DIA-NN/code/run_all.sh
+```
 
-## Original Base and SEA workflows
+To list individual stages:
 
-The original `Base/` and `SEA/` scripts are retained for provenance. Their input formats and layouts differ from the DIA-NN workflow.
+```sh
+Rscript DIA-NN/code/run_analysis.R --help
+```
 
-### Inputs and configuration
+The workflow processes one dataset using configurable input, results, and plot directories. Its sample design, search settings, analysis rules, and stage prerequisites are described in the [workflow documentation](DIA-NN/README.md).
 
-Experimental input data and generated results are not included. The Base configuration refers to `evidence_new.txt` and `proteinGroups_base.txt`. Inspect the configuration and each script for required inputs, packages, sample labels, and paths before running.
+## Repository contents
 
-`Base/CoPPRA_config.R` supports `COPPRA_PROJECT_DIR`, `COPPRA_BASE_OUTPUT`, `COPPRA_OUTPUT_ROOT`, and `COPPRA_BASE_PROTEIN_GROUPS`. Its default project directory is a local desktop path that must be adapted for another machine. `Base/run_Base.R` overrides `COPPRA_PROJECT_DIR` to the parent of its own directory and assumes the original `Base/Code/` layout; review this before using the runner with this repository layout.
+| Location | Contents |
+| --- | --- |
+| [`DIA-NN/code/`](DIA-NN/code/) | Analysis sources, plotting helpers, configuration, dependency checks, and runners. |
+| [`DIA-NN/README.md`](DIA-NN/README.md) | Input requirements, environment setup, commands, and analysis definitions. |
+| [`DIA-NN/reference_package_versions.csv`](DIA-NN/reference_package_versions.csv) | R package versions used for the validated workflow. |
+| [`DIA-NN/limma_source.json`](DIA-NN/limma_source.json) | Source URL and checksum for the required limma version. |
+| [`DIA-NN/VALIDATION.md`](DIA-NN/VALIDATION.md) | Execution checks, comparison with archived results, and live-annotation differences. |
 
-### Running the analyses
+Experimental input data, fitted results, and generated figures are not included. By default, inputs are read from `DIA-NN/Raw_Data/`, results are written to `DIA-NN/results/`, and figures are written to `DIA-NN/plot/`.
 
-Some scripts also depend on outputs from earlier stages and on the original project directory layout. Numbered filenames indicate the intended stage order; inspect each stage's prerequisites.
-
-The original Base and SEA analyses have not been rerun as part of this update. Their supplied analysis scripts are unchanged.
+The complete workflow was validated through all 14 stages using 100 test permutations. The published default is 10,000 permutations; see the [validation record](DIA-NN/VALIDATION.md) for scope and results.

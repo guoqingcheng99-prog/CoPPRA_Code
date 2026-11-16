@@ -88,6 +88,6 @@ Key outputs include `QC/tables/QC_stepwise_peptide_protein_counts.csv`, `Limma/t
 
 PCA plots include individual biological samples and arithmetic group means. The translucent triangles in the replicate view connect three samples and are not confidence regions. Camera settings and original scores are recorded with the output. Plotting changes do not alter fitted PCA coordinates.
 
-The DIA-NN search, empirical library, and 20,431-entry human FASTA differ from the original MaxQuant analysis; numerical outputs should be attributed to this workflow. The original `Base/` and `SEA/` workflows remain available in the repository.
+The DIA-NN search, empirical library, and 20,431-entry human FASTA differ from the original MaxQuant analysis; numerical outputs should be attributed to this workflow.
 
 See [`VALIDATION.md`](VALIDATION.md) for the execution checks, numerical comparison with archived results, and the live-annotation difference observed during preparation of this public workflow.

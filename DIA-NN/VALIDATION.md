@@ -15,4 +15,4 @@ The three KEGG GSEA tables differed because the live query supplied a different 
 
 Existing enrichment warnings remain visible in per-stage warning logs: some PTM categories have undefined enrichment statistics, a small fraction of gene identifiers do not map, and rank ties affect approximation. These were not reinterpreted as significant findings. Additional package-build and plotting deprecation warnings were nonfatal.
 
-This validation covers the DIA-NN workflow. The original `Base/` and `SEA/` scripts were retained without changes and were not rerun.
+This validation covers the DIA-NN workflow.
